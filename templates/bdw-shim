@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# bdw shim — logic ゼロの薄い委譲。canonical bdw(beads-bdw plugin の単一 SSOT)へ exec する。
+#
+# 各 bd-writer repo はこのファイルを自 repo の scripts/bdw に置く(コピー)。直列化ロジックは
+# 一切持たず、canonical を解決して丸投げするだけ(orch-wvd grill 2026-06-23 合意 = 3 copy
+# drift の撲滅)。canonical の場所は BEADS_BDW で上書きできる(既定 = plugin の標準配置)。
+#
+# fail-closed: canonical が見つからない / 実行可能でなければ、bd write を素通しさせず loud に
+# 停止する(exit 1)。素通しすると直列化が外れて lost-update が黙って復活するため。
+set -uo pipefail
+
+_CANON="${BEADS_BDW:-$HOME/.claude/plugins/beads-bdw/bin/bdw}"
+if [ ! -x "$_CANON" ]; then
+  echo "bdw-shim: canonical bdw not found or not executable: $_CANON" >&2
+  echo "bdw-shim: set BEADS_BDW to the canonical bin/bdw, or install the beads-bdw plugin." >&2
+  echo "bdw-shim: fail-closed — bd write NOT run (直列化を外して実行はしない)。" >&2
+  exit 1
+fi
+exec "$_CANON" "$@"

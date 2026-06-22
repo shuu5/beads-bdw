@@ -1,0 +1,5 @@
+{
+  "name": "beads-bdw",
+  "version": "0.1.0",
+  "description": "bd WRITE 直列化ラッパ bdw の単一 SSOT を提供する beads-substrate plugin。全 bd-writer repo が薄い shim 経由で consume する(orch-wvd grill 合意)。canonical bin/bdw が flock でマシン共通の bd WRITE を直列化し lost-update を防ぐ。fail-closed(lock dir 確保不能なら write せず exit 1・/tmp fallback 無し)・self-contained(外部 lib 非依存)。"
+}
