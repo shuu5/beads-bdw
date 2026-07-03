@@ -13,6 +13,10 @@
 #          positive control とし、保持した lock が「bdw が実際に使う lock」であることを担保
 #          する(lock 配線ミスで READ がたまたま速いだけ、を排除する)。
 #   LOCKDIR : `bdw lock-dir` が解決済み lock_dir を stdout に出して exit 0(consumer contract)。
+#   LOCKFILE: `bdw lock-file` が「実際に掴む lock file 絶対パス」を stdout に出して exit 0。本テスト
+#             自身がこの問い合わせを使って holder lock を算出する(lock 算出を mirror 再計算せず
+#             bdw に問い合わせる=別 lock 誤掴みの drift を撲滅・un-7nw)。構造で検証: dir=lock-dir /
+#             name=bd-write-<16hex>.lock。
 #   GUARDBN : 実行ファイルの basename が "bd" でない(guard が basename!="bd" を素通しする性質)。
 #
 # 最重要安全制約: 実 .beads 台帳を絶対に触らない。
@@ -20,11 +24,11 @@
 #   repo root が temp dir 配下であることを検証する。一致しなければ即 ABORT(書込まない)。
 #
 # 3 値判定(RED→GREEN の対比が成立して初めて PASS と言い切る):
-#   PASS(exit 0)         : RED 再現(s<N) ∧ GREEN==N ∧ READ 素通し ∧ LOCKDIR ∧ GUARDBN ok
-#   INCONCLUSIVE(exit 2) : hard 次元(GREEN/READ/LOCKDIR/GUARDBN)は全 ok だが RED 非再現(timing)
-#                          = hazard を実証できず GREEN が vacuous。flaky-FAIL を避けつつ
+#   PASS(exit 0)         : RED 再現(s<N) ∧ GREEN==N ∧ READ 素通し ∧ LOCKDIR ∧ LOCKFILE ∧ GUARDBN ok
+#   INCONCLUSIVE(exit 2) : hard 次元(GREEN/READ/LOCKDIR/LOCKFILE/GUARDBN)は全 ok だが RED 非再現
+#                          (timing)= hazard を実証できず GREEN が vacuous。flaky-FAIL を避けつつ
 #                          「未証明」を明示する。→ 競合環境で再実行 or BDW_SELFTEST_N を上げる。
-#   FAIL(exit 1)         : GREEN 不足 / READ 失敗 / LOCKDIR 不正 / GUARDBN 不一致
+#   FAIL(exit 1)         : GREEN 不足 / READ 失敗 / LOCKDIR 不正 / LOCKFILE 不正 / GUARDBN 不一致
 #
 # 速度: embedded dolt の write は 1 件 ~1s。N=15・RED 数周 + GREEN 直列 + lock 保持テストで
 #   数十秒かかる。
@@ -72,6 +76,20 @@ if [ "$rc_def" -eq 0 ] && [ "$ld_default" = "$HOME/.cache/bdw-locks" ] \
   lockdir_ok=true
 fi
 echo "  LOCKDIR   : default='$ld_default' (rc=$rc_def) / override='$ld_override' (rc=$rc_ovr) -> $([ "$lockdir_ok" = true ] && echo OK || echo FAIL)"
+
+# ─── LOCKFILE: `bdw lock-file` が「実際に掴む lock file 絶対パス」を出して exit 0 すること ────
+# bd を呼ばない問い合わせ経路。本テストはこの問い合わせで holder lock を算出する(下記 READ 節)
+# = lock 算出を mirror 再計算せず bdw に一本化する根拠(別 lock 誤掴みの drift を撲滅・un-7nw)。
+# 構造で検証する(算出を複製せず contract の形を突合): dir == lock-dir、name == bd-write-<16hex>.lock。
+lockfile_ok=false
+lf_out="$("$BDW" lock-file 2>/dev/null)"; rc_lf=$?
+lf_dir_expected="$("$BDW" lock-dir 2>/dev/null)"
+if [ "$rc_lf" -eq 0 ] && [ -n "$lf_out" ] \
+   && [ "$(dirname "$lf_out")" = "$lf_dir_expected" ] \
+   && printf '%s' "$(basename "$lf_out")" | grep -qE '^bd-write-[0-9a-f]{16}\.lock$'; then
+  lockfile_ok=true
+fi
+echo "  LOCKFILE  : lock-file='$lf_out' (rc=$rc_lf) -> $([ "$lockfile_ok" = true ] && echo OK || echo FAIL)"
 
 # ─── throwaway な隔離 bd repo を構築 + 安全検証 ────────────────────────────────
 (
@@ -121,16 +139,13 @@ g="$(run_round "$BDW" green)"
 echo "  GREEN     : survived ${g}/${N}  (via bdw flock)"
 
 # ─── READ-under-lock: write-lock を別プロセスが保持中でも READ は即時素通しすること ───
-# bdw が実際に使う lock_file を同一ロジックで算出(物理パス正規化込み)。算出が bdw とズレると
-# 別ファイルを保持して誤判定するため、直後に WRITE が本当にブロックされるか(positive control)で
-# 「保持した lock = bdw の lock」を担保する。
-lk_common="$(cd "$TMP" && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
-[ -n "$lk_common" ] && lk_common="$(cd "$lk_common" 2>/dev/null && pwd -P || printf '%s' "$lk_common")"
-lk_id="$(printf '%s' "${lk_common:-$TMP}" | sha256sum | cut -c1-16)"
-# bdw と同じ解決ロジックを mirror する(ズレると別 lock を保持して positive control を誤判定。un-7nw)。
-lk_dir="${BDW_LOCK_DIR:-$HOME/.cache/bdw-locks}"
-mkdir -p "$lk_dir" 2>/dev/null || { echo "FAIL: cannot create lock dir $lk_dir" >&2; exit 1; }
-LOCK_FILE="${lk_dir}/bd-write-${lk_id}.lock"
+# bdw が実際に掴む lock_file を bdw 自身に問い合わせて取得する(算出を mirror 再計算しない=un-7nw)。
+# 算出を selftest 側で複製すると bdw とズレ、別 lock を保持して positive control を誤判定しうる——
+# lock-file subcommand の新設でその窓を構造的に塞ぐ。万一問い合わせ結果が bdw の実掴みとズレても、
+# 直後に WRITE が本当にブロックされるか(positive control)で「保持した lock = bdw の lock」を担保する。
+LOCK_FILE="$(cd "$TMP" && "$BDW" lock-file 2>/dev/null)"
+[ -n "$LOCK_FILE" ] || { echo "FAIL: bdw lock-file が空を返した(lock 算出の問い合わせに失敗)" >&2; exit 1; }
+mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || { echo "FAIL: cannot create lock dir for $LOCK_FILE" >&2; exit 1; }
 
 # WRITE positive control 用の probe issue(throwaway DB 内。timeout で打ち切るので副作用なし)
 probe_tid="$(cd "$TMP" && bd create --title "probe-under-lock" --json 2>/dev/null | jq -r '.id')"
@@ -198,6 +213,12 @@ else
   echo "FAIL[LOCKDIR]: bdw lock-dir の出力 or exit code が不正"
   hard_fail=1
 fi
+if [ "$lockfile_ok" = true ]; then
+  echo "ok  [LOCKFILE]: bdw lock-file が lock file 絶対パスを stdout に出して exit 0(consumer contract)"
+else
+  echo "FAIL[LOCKFILE]: bdw lock-file の出力 or exit code が不正"
+  hard_fail=1
+fi
 if [ "$guardbn_ok" = true ]; then
   echo "ok  [GUARDBN]: basename != bd(orchestrator bd-write-guard を無改修で素通し)"
 else
@@ -211,12 +232,12 @@ else
 fi
 
 echo "----------------------------------------------------------------------"
-# 3 値判定: GREEN/READ/LOCKDIR/GUARDBN は hard。RED→GREEN の対比が成立して初めて PASS。
+# 3 値判定: GREEN/READ/LOCKDIR/LOCKFILE/GUARDBN は hard。RED→GREEN の対比が成立して初めて PASS。
 if [ "$hard_fail" -ne 0 ]; then
-  echo "RESULT: FAIL  (GREEN 不足 / READ 未証明 / LOCKDIR 不正 / GUARDBN 不一致)"
+  echo "RESULT: FAIL  (GREEN 不足 / READ 未証明 / LOCKDIR 不正 / LOCKFILE 不正 / GUARDBN 不一致)"
   exit 1
 elif [ "$red_reproduced" = true ]; then
-  echo "RESULT: PASS  (RED 再現 ∧ GREEN==N ∧ READ 素通し ∧ LOCKDIR ∧ GUARDBN = 全機能を明確に実証)"
+  echo "RESULT: PASS  (RED 再現 ∧ GREEN==N ∧ READ 素通し ∧ LOCKDIR ∧ LOCKFILE ∧ GUARDBN = 全機能を明確に実証)"
   exit 0
 else
   echo "RESULT: INCONCLUSIVE  (hard 次元は全 ok だが RED 非再現 = hazard 未実証ゆえ GREEN は vacuous)"
