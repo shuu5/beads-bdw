@@ -42,16 +42,25 @@ chmod +x scripts/bdw
 scripts/bdw update orch-1 --append-notes "..."
 ```
 
-## lock-dir export contract
+## lock-dir / lock-file export contract
 
-consumer(scribe の gen-sandbox `allowWrite` 等)が「bdw が実際に書く dir」を参照するための問い合わせ経路:
+consumer(scribe の gen-sandbox `allowWrite` 等)や selftest が「bdw が実際に使う lock の場所」を
+参照するための問い合わせ経路。どちらも **bd を呼ばず** 解決値だけを stdout に出す(mkdir もしない):
 
 ```sh
-bin/bdw lock-dir   # 解決済み lock_dir を stdout に出して exit 0(bd は呼ばない)
+bin/bdw lock-dir    # 解決済み lock_dir を stdout に出して exit 0
+bin/bdw lock-file   # WRITE で実際に掴む lock file 絶対パスを stdout に出して exit 0(対象 repo 内で呼ぶ)
 ```
 
-`BDW_LOCK_DIR` が設定されていればその値、無ければ `$HOME/.cache/bdw-locks` を返す。
-解決不能(`HOME` 未設定 + `BDW_LOCK_DIR` 未設定)は `exit 1`(空ではなく非 0 で consumer に誤った dir を信用させない)。
+- `lock-dir`: `BDW_LOCK_DIR` が設定されていればその値、無ければ `$HOME/.cache/bdw-locks` を返す。
+- `lock-file`: `<lock_dir>/bd-write-<repo_id>.lock`。`repo_id` は cwd の git common-dir(物理パス正規化済み)の
+  sha256 先頭 16 桁ゆえ **対象 repo 内で呼ぶ**(WRITE パスと同一の解決経路)。git 外なら `$PWD` へ fallback。
+
+いずれも解決不能(`HOME` 未設定 + `BDW_LOCK_DIR` 未設定)は `exit 1`(空ではなく非 0 で consumer に誤った値を信用させない)。
+
+**なぜ `lock-file` が要るか**: consumer/selftest が lock file のパスを自前で mirror 再計算すると、bdw 本体と
+算出がズレて **別 lock を掴み直列化が黙って破れる窓**(un-7nw)になる。問い合わせに一本化してその窓を構造的に塞ぐ。
+実際 `bdw-selftest.sh` の READ-under-lock 節はこの問い合わせで holder lock を算出する(mirror を撤去済み)。
 
 ## 環境変数(任意)
 
@@ -70,7 +79,8 @@ bash bdw-selftest.sh
 
 検証する命題: (a) READ 素通し / (b) WRITE が flock 直列化される(lost-update しない) /
 (c) lock 取得不能で fail-closed / (d) basename != bd で guard を素通しする性質 /
-(e) `bdw lock-dir` が lock_dir を出して exit 0。
+(e) `bdw lock-dir` が lock_dir を出して exit 0 / (f) `bdw lock-file` が lock file 絶対パスを出して exit 0
+(かつ selftest 自身がこの問い合わせで holder lock を算出する)。
 
 3 値判定: `PASS`(exit 0・RED 再現 ∧ 全 hard 次元 ok) / `INCONCLUSIVE`(exit 2・hard は全 ok だが
 RED 非再現=timing) / `FAIL`(exit 1・hard 次元のいずれか失敗)。INCONCLUSIVE は競合環境で再実行するか
