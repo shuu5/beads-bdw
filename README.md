@@ -69,7 +69,34 @@ bin/bdw lock-file   # WRITE で実際に掴む lock file 絶対パスを stdout 
 | `BDW_BD_BIN` | PATH 上の `bd` | bd 実体 |
 | `BDW_LOCK_DIR` | `$HOME/.cache/bdw-locks` | lock 配置 dir(マシン共通の固定絶対パス) |
 | `BDW_LOCK_TIMEOUT` | `60` | flock 待機秒。超過で fail-closed |
+| `BDW_NO_AUTOEXPORT` | (未設定=export 有効) | `=1` で WRITE 後の `.beads/issues.jsonl` auto-export を抑止(batch escape hatch) |
 | `BEADS_BDW`(shim) | `$HOME/.claude/plugins/beads-bdw/bin/bdw` | shim が解決する canonical の場所 |
+
+## auto-export(WRITE 後の issues.jsonl mirror 再生成)
+
+WRITE(`create` / `update` / `close` / `dep` …)が **rc==0** で完了した後、`bdw` は **同一 flock 保持中**に
+`bd export -o <root>/.beads/issues.jsonl` を実行して mirror(`issues.jsonl`)を再生成する。
+これは bd v1.1.0 embedded mode の auto-export 退行で mirror が凍結し、orchestrator の pull hydrate が
+**stale を読む**問題(orch-89v)への恒久 fix。sandbox 外で走る bdw consumer には exec consume 経由で
+一括で効く。**ただし sandboxed worker(scribe bwrap 等)は例外**: sandbox の `allowWrite` は `.beads`
+直下 runtime エントリと lock file だけを grant し `.beads` dir 自体は grant しない(governance 保護・
+sc-nd6/OG-1)一方、`bd export -o` は `.beads` 直下に temp を作り renameat する=`.beads` dir write を要する。
+よって sandbox 内では export が構造的に不能で、`bdw` は毎 write の warn を避けるため **silent skip** する
+(下記「発火条件」)。sandboxed worker の mirror 再生成は **admin/orchestrator の sandbox 外 gate-time
+export に依存**する(この canonical fix は sandbox 内までは届かない)。
+
+- **export 先 root** = git common-dir の親 dir(**anchor root**)。anchor + 全 worktree は物理 1 DB を
+  共有し worktree の `.beads` は tracked ファイルのみゆえ、mirror も anchor の 1 つに収束させる
+  (`repo_id` 解決と同じ「物理 DB と 1 対 1」哲学)。
+- **発火条件**: `rc==0` かつ `BDW_NO_AUTOEXPORT != 1` かつ subcmd が `export` でない(二重 export 回避)
+  かつ export 先 `.beads` dir が実在 **かつ書込可能**。git 外 / `.beads` 不在 / `.beads` dir が
+  read-only(sandbox の bwrap bind・RO mount)は **silent skip**(write は成功のまま・warn も出さない)。
+- **fail-open**: export 失敗は stderr へ warn するだけで **WRITE の exit code を変えない**
+  (Dolt への write は既に commit 済・mirror だけ stale になる)。抑止は `BDW_NO_AUTOEXPORT=1`。
+  なお `.beads` が read-only な sandbox では上記 silent skip に落ちるため warn は出ない(構造的に
+  export 不能な環境で毎 write 警告を撒かない)。残る warn は「書けるはずが失敗した」真の異常のみ。
+- **無限ループ排除**: export は `bd` を直接呼ぶ(`bdw` 再帰なし)。READ 系(`list` / `show` …)では
+  export は走らない(lock も取らない素通しパスのため)。
 
 ## selftest
 
@@ -80,7 +107,9 @@ bash bdw-selftest.sh
 検証する命題: (a) READ 素通し / (b) WRITE が flock 直列化される(lost-update しない) /
 (c) lock 取得不能で fail-closed / (d) basename != bd で guard を素通しする性質 /
 (e) `bdw lock-dir` が lock_dir を出して exit 0 / (f) `bdw lock-file` が lock file 絶対パスを出して exit 0
-(かつ selftest 自身がこの問い合わせで holder lock を算出する)。
+(かつ selftest 自身がこの問い合わせで holder lock を算出する) /
+(g) auto-export: WRITE 後に mirror 再生成 / `BDW_NO_AUTOEXPORT=1` で skip / export 失敗でも WRITE の
+exit code=0 温存(fail-open) / READ では auto-export が走らない。
 
 3 値判定: `PASS`(exit 0・RED 再現 ∧ 全 hard 次元 ok) / `INCONCLUSIVE`(exit 2・hard は全 ok だが
 RED 非再現=timing) / `FAIL`(exit 1・hard 次元のいずれか失敗)。INCONCLUSIVE は競合環境で再実行するか
