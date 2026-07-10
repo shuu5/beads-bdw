@@ -54,6 +54,20 @@
 #                    旧既定 ${XDG_RUNTIME_DIR:-/tmp} は tmux / systemd timer / 別 login で各々
 #                    別 dir(別 lock)を掴み、直列化が黙って破れる窓があった(un-7nw)。
 #   BDW_LOCK_TIMEOUT flock 待機秒(既定: 60)。超過で fail-closed。
+#   BDW_NO_AUTOEXPORT WRITE 成功後の .beads/issues.jsonl auto-export を抑止(=1 で skip)。
+#                    batch 投入等で毎 write の export overhead を避けたいときの escape hatch
+#                    (orch-89v 恒久 fix。既定は auto-export 有効=mirror を write 毎に最新化)。
+#
+# AUTO-EXPORT ──────────────────────────────────────────────────────────────────
+#   WRITE(create/update/close/dep/…)が rc==0 で完了した後、同一 flock 保持中に
+#   `bd export -o <root>/.beads/issues.jsonl` で mirror を再生成する(root=git common-dir の親
+#   =anchor root に収束)。bd v1.1.0 embedded mode の auto-export 退行で mirror が凍結し
+#   orchestrator の pull hydrate が stale を読む問題への恒久対応(orch-89v)。fail-open: export
+#   失敗は warn のみで WRITE の exit code を変えない。抑止は BDW_NO_AUTOEXPORT=1。
+#   sandbox 例外: scribe bwrap 等の sandboxed worker では .beads dir 自体が read-only bind で
+#   export の temp+rename(.beads 直下エントリ生成)が構造的に不能ゆえ silent skip する(毎 write の
+#   warn でログを汚さない)。そのため sandboxed worker の mirror 再生成は canonical では効かず
+#   admin/orchestrator の sandbox 外 gate-time export に委ねる(finding orch-89v-sbx・下記本体参照)。
 
 set -uo pipefail
 
@@ -98,6 +112,51 @@ resolve_lock_file() {
   ld="$(resolve_lock_dir)" || return 1
   rid="$(resolve_repo_id)"
   printf '%s/bd-write-%s.lock' "$ld" "$rid"
+}
+
+# --- export root 解決(inline・auto-export の mirror 先を単一物理 mirror に収束させる) ------
+# export 先 root = git common-dir の親 dir。anchor + 全 worktree は git common-dir 経由で「物理
+# 1 つの DB」を共有し、worktree の .beads は tracked ファイルのみ(embeddeddolt/issues.jsonl は
+# anchor 一元)ゆえ、mirror(issues.jsonl)も anchor root の 1 つに収束させる(repo_id 解決と同じ
+# 「物理 DB と 1 対 1」哲学)。common-dir は物理パスへ正規化(symlink 経由の別名でも同一に収束)。
+# git 外(common-dir 得られず)は return 1 → 上流で silent skip(export しない・write は成功のまま)。
+resolve_export_root() {
+  local common_dir
+  common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  [ -z "$common_dir" ] && common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+  [ -z "$common_dir" ] && return 1
+  common_dir="$(cd "$common_dir" 2>/dev/null && pwd -P || printf '%s' "$common_dir")"
+  printf '%s' "$(dirname "$common_dir")"
+}
+
+# --- auto-export: WRITE 成功後に .beads/issues.jsonl mirror を再生成(orch-89v 恒久 fix) -----
+# bd v1.1.0 embedded mode の auto-export 退行で mirror が凍結し、orchestrator の pull hydrate が
+# stale を読む問題への恒久対応。WRITE の flock 保持中(fd 9 open)に走らせ export も直列化する
+# (設計意図)。発火条件(A2): rc==0 かつ BDW_NO_AUTOEXPORT!=1(batch escape hatch)かつ subcmd!=export
+# (手動 export 直後の二重 export 回避)かつ export 先 .beads dir が実在。export は bd を直接呼ぶ
+# (bdw 再帰なし=無限ループを構造的に排除)。fail-open: export 失敗は warn のみで WRITE の exit code
+# を変えない(成功 write を失敗化しない)。git 外 / .beads 不在は silent skip(export しない)。
+# sandbox 例外(orch-89v-sbx): scribe bwrap の allowWrite は .beads 直下 runtime エントリ
+# (embeddeddolt/ 等)と lock file **のみ** を grant し、governance 保護のため .beads dir 自体は
+# grant しない(sc-nd6/OG-1)。ところが `bd export -o` は in-place でなく .beads 直下に temp
+# (.~issues.jsonl.<rand>)を O_CREAT|O_EXCL で作り renameat する=`.beads` dir への write を要する。
+# よって sandboxed worker では毎 write で必ず export が拒否され、fail-open の warn がログを汚す。
+# `.beads` dir が書けない(=read-only bind の sandbox / RO mount)環境では **warn を出さず silent
+# skip** し、mirror 再生成は admin/orchestrator の sandbox 外 gate-time export に委ねる。残る warn
+# 経路は「.beads は書けるはずなのに export が失敗した」真の異常だけに限定される(disk full 等)。
+maybe_auto_export() {
+  local export_rc="$1" root
+  [ "$export_rc" -eq 0 ] || return 0
+  [ "${BDW_NO_AUTOEXPORT:-}" = "1" ] && return 0
+  [ "$subcmd" = "export" ] && return 0
+  root="$(resolve_export_root)" || return 0
+  [ -d "$root/.beads" ] || return 0
+  # sandbox / RO mount(構造的に export 不能)は silent skip: temp 作成に要る .beads dir write が
+  # 無ければ export は必ず失敗する。毎 write の warn を避けるためここで no-op に落とす。
+  [ -w "$root/.beads" ] || return 0
+  if ! "$BD_BIN" export -o "$root/.beads/issues.jsonl" >/dev/null 2>&1; then
+    echo "bdw: auto-export failed (write は Dolt へ commit 済・mirror のみ stale)" >&2
+  fi
 }
 
 # --- lock-dir export subcommand: 解決済み lock_dir を stdout に出して exit(bd は呼ばない) ---
@@ -178,11 +237,16 @@ lock_file="$(resolve_lock_file)"
 
 timeout_s="${BDW_LOCK_TIMEOUT:-60}"
 
-# fd 9 を lock file に開き flock 取得 → 保持したまま bd を exec(fd 9 は bd に継承され、
-# bd 終了時に閉じられて lock が解放される)。bd の exit code がそのまま bdw の exit code。
+# fd 9 を lock file に開き flock 取得 → 保持したまま bd を子プロセスで実行(exec しない)。fd 9 は
+# 本 shell が握り続けるため、bd 終了後も lock は解放されず、続く auto-export も同一 flock 保持中に
+# 走る(export の直列化も兼ねる=設計意図)。lock は本 shell の exit(fd 9 close)で解放される。
+# bd の stdout/stderr は素通し・exit code(rc)を厳密温存し、auto-export の成否に依らず rc で終える。
 exec 9>"$lock_file" || { echo "bdw: cannot open lock file: $lock_file" >&2; exit 1; }
 if ! flock -w "$timeout_s" 9; then
   echo "bdw: could not acquire bd-write lock within ${timeout_s}s ($lock_file); fail-closed — '$subcmd' not run" >&2
   exit 1
 fi
-exec "$BD_BIN" "$@"
+"$BD_BIN" "$@"
+rc=$?
+maybe_auto_export "$rc"   # rc==0 かつ条件成立時のみ mirror を再生成(fail-open・rc は不変)
+exit "$rc"

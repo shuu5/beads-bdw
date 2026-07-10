@@ -18,17 +18,24 @@
 #             bdw に問い合わせる=別 lock 誤掴みの drift を撲滅・un-7nw)。構造で検証: dir=lock-dir /
 #             name=bd-write-<16hex>.lock。
 #   GUARDBN : 実行ファイルの basename が "bd" でない(guard が basename!="bd" を素通しする性質)。
+#   AUTOEXPORT: WRITE 成功後に .beads/issues.jsonl mirror を再生成(orch-89v 恒久 fix)。
+#             (i) WRITE 後に mirror 再生成・対象 issue を含む / (ii) BDW_NO_AUTOEXPORT=1 で skip /
+#             (iii) export 失敗を模擬しても WRITE の exit code=0 温存(fail-open) /
+#             (iv) READ では auto-export が走らない /
+#             (v) worktree→anchor 収束(A3): worktree 内からの WRITE でも mirror は anchor
+#                 (git common-dir の親)の 1 つに収束し worktree 側 .beads/issues.jsonl は書かれない
+#                 (show-toplevel 退行を落とす positive/negative の対比)。全て throwaway $TMP repo 内で実証。
 #
 # 最重要安全制約: 実 .beads 台帳を絶対に触らない。
 #   本テストは mktemp の throwaway な git+bd repo だけを使い、書込前に `bd context` の
 #   repo root が temp dir 配下であることを検証する。一致しなければ即 ABORT(書込まない)。
 #
 # 3 値判定(RED→GREEN の対比が成立して初めて PASS と言い切る):
-#   PASS(exit 0)         : RED 再現(s<N) ∧ GREEN==N ∧ READ 素通し ∧ LOCKDIR ∧ LOCKFILE ∧ GUARDBN ok
-#   INCONCLUSIVE(exit 2) : hard 次元(GREEN/READ/LOCKDIR/LOCKFILE/GUARDBN)は全 ok だが RED 非再現
+#   PASS(exit 0)         : RED 再現(s<N) ∧ GREEN==N ∧ READ 素通し ∧ LOCKDIR ∧ LOCKFILE ∧ GUARDBN ∧ AUTOEXPORT ok
+#   INCONCLUSIVE(exit 2) : hard 次元(GREEN/READ/LOCKDIR/LOCKFILE/GUARDBN/AUTOEXPORT)は全 ok だが RED 非再現
 #                          (timing)= hazard を実証できず GREEN が vacuous。flaky-FAIL を避けつつ
 #                          「未証明」を明示する。→ 競合環境で再実行 or BDW_SELFTEST_N を上げる。
-#   FAIL(exit 1)         : GREEN 不足 / READ 失敗 / LOCKDIR 不正 / LOCKFILE 不正 / GUARDBN 不一致
+#   FAIL(exit 1)         : GREEN 不足 / READ 失敗 / LOCKDIR 不正 / LOCKFILE 不正 / GUARDBN 不一致 / AUTOEXPORT 不正
 #
 # 速度: embedded dolt の write は 1 件 ~1s。N=15・RED 数周 + GREEN 直列 + lock 保持テストで
 #   数十秒かかる。
@@ -193,6 +200,65 @@ echo "  READ-under-lock passes  : $([ "$read_ok" = true ] && echo OK || echo FAI
 read_proven=false
 [ "$read_ok" = true ] && [ "$write_blocked" = true ] && read_proven=true
 
+# ─── AUTOEXPORT: WRITE 成功後の .beads/issues.jsonl mirror 再生成(orch-89v 恒久 fix) ───
+# throwaway $TMP repo(git common-dir の親 = $TMP・.beads 実在)を使い 5 命題を実証する:
+#   (i)   WRITE(update)後に $TMP/.beads/issues.jsonl が再生成され、対象 issue を含む
+#   (ii)  BDW_NO_AUTOEXPORT=1 では auto-export が skip される(mirror が再生成されない)
+#   (iii) export 失敗を模擬(issues.jsonl を dir 化=書込不能)しても WRITE の exit code=0 温存(fail-open)
+#   (iv)  READ(list)では auto-export が走らない(mirror 再生成されない)
+#   (v)   worktree→anchor 収束(A3 の load-bearing 差別化): $TMP に git worktree を張り、worktree 内から
+#         WRITE すると mirror は anchor($TMP)の .beads/issues.jsonl に収束し、worktree 側の
+#         .beads/issues.jsonl は書かれない。worktree の .beads は tracked ファイルのみ(embeddeddolt
+#         不在=物理 DB は anchor 一元)だが .beads dir 自体は checkout で実在するため、resolve_export_root
+#         が show-toplevel へ退行すると『.beads 実在』条件を満たして worktree 側へ stale mirror を書く——
+#         その退行を負側 assert(worktree mirror 不在)で検出する(plain repo では両実装が同結果で検出不能)。
+JSONL="$TMP/.beads/issues.jsonl"
+ae_tid="$(cd "$TMP" && bd create --title "autoexport-target" --json 2>/dev/null | jq -r '.id')"
+
+# (i) WRITE で mirror が再生成され、対象 issue を含む
+ae_i_ok=false
+rm -f "$JSONL"
+( cd "$TMP" && "$BDW" update "$ae_tid" --append-notes "AE_i" >/dev/null 2>&1 )
+if [ -n "$ae_tid" ] && [ -s "$JSONL" ] && grep -q "$ae_tid" "$JSONL" 2>/dev/null; then ae_i_ok=true; fi
+
+# (ii) BDW_NO_AUTOEXPORT=1 で skip(escape hatch)
+ae_ii_ok=false
+rm -f "$JSONL"
+( cd "$TMP" && BDW_NO_AUTOEXPORT=1 "$BDW" update "$ae_tid" --append-notes "AE_ii" >/dev/null 2>&1 )
+[ ! -e "$JSONL" ] && ae_ii_ok=true
+
+# (iii) export 失敗を模擬(issues.jsonl を dir 化 → -o が書けず export 失敗)しても WRITE rc=0 温存
+ae_iii_ok=false
+rm -f "$JSONL"; mkdir -p "$JSONL"
+if ( cd "$TMP" && "$BDW" update "$ae_tid" --append-notes "AE_iii" >/dev/null 2>&1 ); then
+  ae_iii_ok=true   # WRITE は成功(rc=0)= fail-open で mirror 失敗を write に波及させない
+fi
+rmdir "$JSONL" 2>/dev/null || rm -rf "$JSONL"
+
+# (iv) READ(list)では auto-export が走らない(素通しパスは lock も export も取らない)
+ae_iv_ok=false
+rm -f "$JSONL"
+( cd "$TMP" && "$BDW" list >/dev/null 2>&1 )
+[ ! -e "$JSONL" ] && ae_iv_ok=true
+
+# (v) worktree→anchor 収束: $TMP に worktree を張り、その中から WRITE。mirror は anchor($TMP)へ
+#     収束し(正側 assert)、worktree 側 .beads/issues.jsonl は書かれない(負側 assert=show-toplevel 退行検出)。
+ae_v_ok=false
+WT="$TMP/.worktrees/wt"
+if ( cd "$TMP" && git worktree add -q "$WT" -b bdw-selftest-wt >/dev/null 2>&1 ); then
+  wt_jsonl="$WT/.beads/issues.jsonl"
+  rm -f "$JSONL" "$wt_jsonl"
+  ( cd "$WT" && "$BDW" update "$ae_tid" --append-notes "AE_v_wt" >/dev/null 2>&1 )
+  # 正側: anchor($TMP)の mirror が再生成され対象 issue を含む / 負側: worktree 側 mirror は不在
+  if [ -s "$JSONL" ] && grep -q "$ae_tid" "$JSONL" 2>/dev/null && [ ! -e "$wt_jsonl" ]; then
+    ae_v_ok=true
+  fi
+fi
+
+autoexport_ok=false
+[ "$ae_i_ok" = true ] && [ "$ae_ii_ok" = true ] && [ "$ae_iii_ok" = true ] && [ "$ae_iv_ok" = true ] && [ "$ae_v_ok" = true ] && autoexport_ok=true
+echo "  AUTOEXPORT: (i)regen=$ae_i_ok (ii)skip=$ae_ii_ok (iii)failopen-rc0=$ae_iii_ok (iv)read-noexport=$ae_iv_ok (v)wt->anchor=$ae_v_ok -> $([ "$autoexport_ok" = true ] && echo OK || echo FAIL)"
+
 echo "----------------------------------------------------------------------"
 hard_fail=0
 if [ "$g" -eq "$N" ]; then
@@ -225,6 +291,12 @@ else
   echo "FAIL[GUARDBN]: basename が bd(guard 素通しの前提が壊れている)"
   hard_fail=1
 fi
+if [ "$autoexport_ok" = true ]; then
+  echo "ok  [AUTOEXPORT]: WRITE 後に mirror 再生成 / NO_AUTOEXPORT=1 skip / fail-open rc=0 / READ 無 export"
+else
+  echo "FAIL[AUTOEXPORT]: (i)regen=$ae_i_ok (ii)skip=$ae_ii_ok (iii)failopen-rc0=$ae_iii_ok (iv)read-noexport=$ae_iv_ok (v)wt->anchor=$ae_v_ok"
+  hard_fail=1
+fi
 if [ "$red_reproduced" = true ]; then
   echo "ok  [RED]:   bdw 無しで lost-update を再現(hazard 実在を確認=対比成立)"
 else
@@ -232,12 +304,12 @@ else
 fi
 
 echo "----------------------------------------------------------------------"
-# 3 値判定: GREEN/READ/LOCKDIR/LOCKFILE/GUARDBN は hard。RED→GREEN の対比が成立して初めて PASS。
+# 3 値判定: GREEN/READ/LOCKDIR/LOCKFILE/GUARDBN/AUTOEXPORT は hard。RED→GREEN の対比が成立して初めて PASS。
 if [ "$hard_fail" -ne 0 ]; then
-  echo "RESULT: FAIL  (GREEN 不足 / READ 未証明 / LOCKDIR 不正 / LOCKFILE 不正 / GUARDBN 不一致)"
+  echo "RESULT: FAIL  (GREEN 不足 / READ 未証明 / LOCKDIR 不正 / LOCKFILE 不正 / GUARDBN 不一致 / AUTOEXPORT 不正)"
   exit 1
 elif [ "$red_reproduced" = true ]; then
-  echo "RESULT: PASS  (RED 再現 ∧ GREEN==N ∧ READ 素通し ∧ LOCKDIR ∧ LOCKFILE ∧ GUARDBN = 全機能を明確に実証)"
+  echo "RESULT: PASS  (RED 再現 ∧ GREEN==N ∧ READ 素通し ∧ LOCKDIR ∧ LOCKFILE ∧ GUARDBN ∧ AUTOEXPORT = 全機能を明確に実証)"
   exit 0
 else
   echo "RESULT: INCONCLUSIVE  (hard 次元は全 ok だが RED 非再現 = hazard 未実証ゆえ GREEN は vacuous)"
