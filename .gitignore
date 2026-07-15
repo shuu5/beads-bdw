@@ -1,0 +1,5 @@
+# worker/scribe scratch(untracked・commit しない)
+.scribe-envprobe
+*.local.sh
+*.local.log
+*.local.md

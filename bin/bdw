@@ -71,6 +71,12 @@
 
 set -uo pipefail
 
+# --- 自己 dir 解決(sibling bin/bdw-sync=Layer1 seam を呼ぶため) --------------------------
+# shim は canonical を exec するため $0=canonical bin/bdw の実パス。直接起動でも同様。
+# ★serializer 核(flock/lock/write)は bin/bdw-sync を「source しない」= subprocess 呼出しのみ。
+#   bdw-sync 不在でも serializer 核は素通しで機能する(fail-open)=self-contained 核を維持(un-10h5)。
+_BDW_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P || printf '%s' ".")"
+
 # --- lock dir 解決(inline・self-contained・fail-closed) ---------------------------
 # 同一マシン・同一 user の全 bd writer が同じ「固定絶対パス」に合意する必要がある。既定を
 # $HOME 下の固定 dir に pin する。旧既定 ${XDG_RUNTIME_DIR:-/tmp} は tmux / systemd timer /
@@ -144,6 +150,36 @@ resolve_export_root() {
 # `.beads` dir が書けない(=read-only bind の sandbox / RO mount)環境では **warn を出さず silent
 # skip** し、mirror 再生成は admin/orchestrator の sandbox 外 gate-time export に委ねる。残る warn
 # 経路は「.beads は書けるはずなのに export が失敗した」真の異常だけに限定される(disk full 等)。
+# --- Layer1: WRITE 直前の自台帳 freshness pull(flock 保持中=直列化済み・un-10h5) -----------
+# データ WRITE(create/update/close/dep 等)の前に自台帳を pull-if-stale する。単一 writer 規律を
+# 「全機 write 可+書く前 pull」へ転換する 3 層 hook の Layer1 実体(seam=bin/bdw-sync)。
+# 分岐は「bdw-sync exit 3(genuine merge-conflict)= WRITE を block(fail-closed)」のみに依存し、
+# transient/offline/remote 未設定は bdw-sync 側で degrade(exit 0)されて WRITE は続行する。
+# bdw-sync 不在は fail-open(pull を skip+warn)=serializer 核を止めない(self-contained 核)。
+# 同期系 subcmd(dolt/export/import/bootstrap/init/migrate/compact)は自動 pull の対象外
+#   (dolt/export=同期系そのもの・二重 pull/再帰回避 / bootstrap/init/import/migrate=DB lifecycle で
+#    先行 pull が不適切)。それ以外(データ write + 未知)は pull-if-stale する(迷えば freshen=安全)。
+maybe_layer1_pull() {
+  case "$subcmd" in
+    dolt|export|import|bootstrap|init|migrate|compact) return 0 ;;
+  esac
+  local sync="$_BDW_DIR/bdw-sync"
+  if [ ! -x "$sync" ]; then
+    echo "bdw: Layer1 sync helper 不在($sync)— pull を skip(fail-open)。" >&2
+    return 0
+  fi
+  # bdw は既に flock(fd 9)を保持しているため bdw-sync に --lock を渡さない(再 flock で self-deadlock 回避)。
+  # bd 実体は bdw と同一(BDW_BD_BIN 継承)。
+  BDW_BD_BIN="$BD_BIN" "$sync" pull-if-stale
+  local sync_rc=$?
+  if [ "$sync_rc" -eq 3 ]; then
+    echo "bdw: 自台帳の genuine merge-conflict により WRITE を中止しました(fail-closed)。'$subcmd' not run。" >&2
+    echo "bdw: 復旧後に再実行してください(手順は上記 bdw-sync banner 参照)。" >&2
+    exit 3
+  fi
+  return 0
+}
+
 maybe_auto_export() {
   local export_rc="$1" root
   [ "$export_rc" -eq 0 ] || return 0
@@ -246,6 +282,7 @@ if ! flock -w "$timeout_s" 9; then
   echo "bdw: could not acquire bd-write lock within ${timeout_s}s ($lock_file); fail-closed — '$subcmd' not run" >&2
   exit 1
 fi
+maybe_layer1_pull          # Layer1: flock 保持中に自台帳を freshen(genuine conflict なら exit 3 で block)
 "$BD_BIN" "$@"
 rc=$?
 maybe_auto_export "$rc"   # rc==0 かつ条件成立時のみ mirror を再生成(fail-open・rc は不変)

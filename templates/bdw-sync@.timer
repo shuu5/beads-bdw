@@ -1,0 +1,22 @@
+# bdw-sync@.timer — bd write 協調 hook Layer3 の周期起動(15分毎目安)。
+#
+# un-10h5 契約: 「systemd user timer(15分毎目安)で pull+未 push あれば push(セッション非依存の
+# 決定論)」。%i は systemd-escape した台帳 repo root 絶対パス(service と対)。
+#
+# 有効化(per-machine 手動・常時起動サーバー機のみ):
+#   systemctl --user enable --now "bdw-sync@$(systemd-escape /path/to/ledger).timer"
+# 詳細は BDW-SYNC-INSTALL.md 参照。
+
+[Unit]
+Description=bd write 協調 Layer3 timer: 15分毎に自台帳 pull+push (%I)
+
+[Timer]
+# 起動 2 分後に初回、以後 15 分毎。RandomizedDelaySec で多台帳同時発火の thundering herd を散らす。
+OnBootSec=2min
+OnUnitActiveSec=15min
+RandomizedDelaySec=90
+# suspend 中に逃した発火を復帰後に 1 回まとめて実行(常時起動サーバーでも安全側)。
+Persistent=true
+
+[Install]
+WantedBy=timers.target
