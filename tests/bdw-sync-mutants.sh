@@ -17,6 +17,9 @@
 #   ① 自台帳のみ        : M6 pull に -C /foreign を注入            : invariant1-self-only
 #   bdw block          : M7 bin/bdw の exit3 block を無効化       : bdw-block
 #   Layer3 lock 直列化 : M8 run_locked の flock 失敗 skip を反転   : lock-coordination
+#   ⑦ 複合 scheme(L1)  : M9a scheme 照合を旧 [a-z]+:// へ revert   : scheme-git-https-pull
+#   ⑦ 複合 scheme(L3)  : M9b 同上(push 経路を独立に保証)          : scheme-git-https-push
+#   ⑦ over-match 制御  : M10 scheme 照合を何でも通るに緩める      : scheme-no-url
 
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
@@ -109,6 +112,28 @@ run_mutant M7-no-block bdw \
 run_mutant M8-lock-fail-open bdw-sync \
   's/flock 取得失敗 — skip(次回 timer で回収)" >&2; return 0; }/flock 取得失敗 — skip(次回 timer で回収)" >\&2; : ; }/' \
   "lock-coordination" "run_locked-lock-fail"
+
+# M9: has_remote の scheme 照合を修正前の素朴な [a-z]+:// へ revert → 複合 scheme(git+https://)が
+#     NO-MATCH に戻り、remote 有りでも do_pull/do_push が no-op 枝に落ちて dolt を呼ばない(un-l3ln)。
+#     ＝「修正前 FAIL / 修正後 PASS」の対称実証(新 case の非空虚性の機械保証)。
+#     ★pull/push を 1 filter に束ねない: run_mutant の判定は bats の集約 rc(:60)のみで、filter が
+#       複数 case にマッチすると片方 FAIL でも ok と記録される=もう片方が将来 vacuous 化しても
+#       緑のまま通る。Layer1/Layer3 の各経路を独立に機械保証するため 2 呼出しへ分ける。
+SCHEME_REVERT='s#\[a-z\]\[A-Za-z0-9+.-\]\*://#[a-z]+://#'
+run_mutant M9a-scheme-revert-pull bdw-sync "$SCHEME_REVERT" \
+  "scheme-git-https-pull" "⑦scheme-composite(L1)"
+run_mutant M9b-scheme-revert-push bdw-sync "$SCHEME_REVERT" \
+  "scheme-git-https-push" "⑦scheme-composite(L3)"
+
+# M10: scheme 照合を「何でも通る」へ緩める(over-match 方向) → URL でない行まで remote 有りと誤認し
+#      no-op すべき場面で dolt を呼ぶ。M9 は under-match 方向のみを守るため、FENCE-2 が要求する
+#      「^ アンカーと name 列を維持(over-match 回帰なし)」側は本 mutant が担う。
+#      ★M3(has_remote 常に真)は代替にならない: 対応する invariant7-noremote は手前の
+#        'No remotes configured' 短絡で拾われ scheme 正規表現に構造的に盲目(実測)。ゆえに
+#        over-match は scheme-no-url でしか捕まらず、その非空虚性は本 mutant でのみ機械保証される。
+run_mutant M10-scheme-overmatch bdw-sync \
+  "s#grep -qE '\^[^']*'#grep -qE '.'#" \
+  "scheme-no-url" "⑦scheme-overmatch"
 
 echo "----" | tee -a "$LOG"
 if [ "$fails" -eq 0 ]; then

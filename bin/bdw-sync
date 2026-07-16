@@ -144,7 +144,11 @@ has_remote() {
   out="$(bd_net "$BD_BIN" dolt remote list 2>&1)" || return 1
   printf '%s' "$out" | grep -qi 'No remotes configured' && return 1
   # 少なくとも 1 行の remote エントリ(name url 形式)があるか。
-  printf '%s' "$out" | grep -qE '^[[:alnum:]_.-]+[[:space:]]+[a-z]+://' && return 0
+  # ★scheme は RFC3986 準拠(ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ))で照合する。素朴な
+  #   [a-z]+:// は複合 scheme の "+" に到達できず git+https:// / git+file:// を NO-MATCH にし、
+  #   fleet の dolt remote(全て git+https://)で has_remote が常に false→do_pull/do_push が
+  #   no-op 枝に落ちて marker だけ touch し「同期済み」を偽装する silent 回帰になる(un-l3ln)。
+  printf '%s' "$out" | grep -qE '^[[:alnum:]_.-]+[[:space:]]+[a-z][A-Za-z0-9+.-]*://' && return 0
   return 1
 }
 
