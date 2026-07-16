@@ -4,6 +4,12 @@ bd write 協調 hook の **Layer3** = セッション非依存に自台帳を pu
 Layer1(`bin/bdw` の WRITE 直前 pull)/ Layer2(admin Stop hook 即 push)を取りこぼしても、
 timer が周期的に鮮度を回収する **fail-safe backstop**。
 
+> 注: この timer が回す `bdw-sync pull-push` は **pull+push のみ**で、pull 後の
+> `issues.jsonl` mirror-export(auto-export)は**含まない**(`pull_push_impl` =
+> `do_pull`→`do_push` のみ・export 呼出なし)。issues.jsonl mirror の再生成を担うのは
+> `bin/bdw` の WRITE 経路(`maybe_auto_export`)だけで、L3 timer は Dolt 台帳の
+> pull/push に閉じる。※本注記は L3 経路の事実共有であり、runbook の scope や mirror 要求を変えない。
+
 > ⚠ **per-machine 手動・常時起動サーバー機のみ。自動配線しない**(un-10h5 契約)。
 > ノート PC 等の間欠起動機は Layer1/Layer2 で十分。timer は「常時起動でセッション外でも
 > 台帳を触りうるサーバー機」だけに、その機のオペレータが明示的に enable する。
@@ -34,6 +40,25 @@ systemctl --user enable --now "bdw-sync@$(systemd-escape "$LEDGER").timer"
 
 `%i`(instance 名)= `systemd-escape` した台帳 root 絶対パス。`%I` は service 内で unescape され
 `bdw-sync pull-push --lock --repo %I` の `--repo` に渡る(timer には cwd が無いため必須)。
+
+## 既知の対象インスタンス(per-machine)
+
+- **ipatho-1 / orch(scriptorium)clone**: `/home/shuu5/projects/local-projects/scriptorium`
+  (dolt remote = `git+https://github.com/shuu5/scriptorium.git` 設定済 = graceful no-op ではなく
+  pull-push 対象になりうる)。escape 後 instance = `bdw-sync@-home-shuu5-projects-local\x2dprojects-scriptorium.timer`。
+  ただし **enable は無条件で行わない**: orch を universal sync に include するかは orch-ese5 裁定
+  (a)案「条件付き include 予定」が gate で、その 2 前提 — ① un-10h5 land 済み実層での scriptorium
+  側 re-spike が GREEN(Seq-2/Seq-5)、② 実 GitHub dolt-remote 往復(push/pull round-trip)を
+  非 sandbox admin が確認 — の**双方充足後**に限る。裁定確定(un-7fxm 返送)前・前提未充足の段階では
+  enable しない。bespoke な ipatho-1 専用 timer は作らず、上記 template@ 流用で enable する。
+
+```sh
+# enable は上記 2 前提充足後のみ。今は記録のみ(実行しない)。
+LEDGER=/home/shuu5/projects/local-projects/scriptorium
+systemctl --user enable --now "bdw-sync@$(systemd-escape "$LEDGER").timer"
+#  → instance: bdw-sync@-home-shuu5-projects-local\x2dprojects-scriptorium.timer
+#  前提(確認済): sync.remote(git+https://github.com/shuu5/scriptorium.git)設定済・linger=yes 済
+```
 
 ## 動作確認
 
