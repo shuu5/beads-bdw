@@ -1,0 +1,30 @@
+# bdw-sync@.service — bd write 協調 hook Layer3(systemd user timer が起動する oneshot)。
+#
+# un-10h5(bd write 協調 hook 3層)Leg-A の Layer3。セッション非依存に自台帳を pull+push する
+# per-machine push authority の一次経路。Layer1(bin/bdw の WRITE 直前 pull)/ Layer2(admin Stop
+# hook 即 push)を取りこぼしても、timer が周期的に pull+push して鮮度を回収する(fail-safe backstop)。
+#
+# ★配線は per-machine 手動(常時起動サーバー機のみ・自動配線しない=un-10h5 契約)。同梱するのは
+#   template のみで、どの台帳を sync するかは INSTALL.md の手順で各機が明示的に enable する。
+#
+# instance 名 %i = systemd-escape した「台帳 repo root の絶対パス」。
+#   例: systemctl --user enable --now "bdw-sync@$(systemd-escape /home/me/ledger).timer"
+# %I = unescape 版(実パス)。ExecStart は %I を --repo に渡す。
+#
+# 同期入口は bin/bdw-sync(Layer1 と同一 seam=invariant④)。--lock で bin/bdw と同一 flock を掴み
+# worker の WRITE と直列化する。--repo で timer に cwd が無い問題を解消する。
+
+[Unit]
+Description=bd write 協調 Layer3: 自台帳 pull+push (%I)
+# 常時起動サーバーの network 前提(file:// remote では無害)。
+After=network-online.target
+
+[Service]
+Type=oneshot
+# BEADS_BDW_HOME は beads-bdw plugin の配置(既定は標準 plugin path)。INSTALL.md で必要なら上書き。
+Environment=BEADS_BDW_HOME=%h/.claude/plugins/beads-bdw
+# 自台帳を pull+push。genuine conflict は bdw-sync が block+loud(exit 3)し journal に残る
+# (timer は次回また試行する=回収)。transient は degrade(exit 0)。
+ExecStart=%h/.claude/plugins/beads-bdw/bin/bdw-sync pull-push --lock --repo %I
+# 失敗しても timer は生き続ける(次周期で回収)。ログは journalctl --user -u bdw-sync@ で読む。
+Nice=10

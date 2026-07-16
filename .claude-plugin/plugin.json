@@ -1,5 +1,5 @@
 {
   "name": "beads-bdw",
   "version": "0.1.0",
-  "description": "bd WRITE 直列化ラッパ bdw の単一 SSOT を提供する beads-substrate plugin。全 bd-writer repo が薄い shim 経由で consume する(orch-wvd grill 合意)。canonical bin/bdw が flock でマシン共通の bd WRITE を直列化し lost-update を防ぐ。fail-closed(lock dir 確保不能なら write せず exit 1・/tmp fallback 無し)・self-contained(外部 lib 非依存)。"
+  "description": "bd WRITE 直列化ラッパ bdw + bd write 協調 hook(Layer1/Layer3)の単一 SSOT を提供する beads-substrate plugin。全 bd-writer repo が薄い shim 経由で consume する(orch-wvd grill 合意)。canonical bin/bdw が flock でマシン共通の bd WRITE を直列化し lost-update を防ぐ。Layer1(WRITE 直前の自台帳 pull-if-stale・genuine conflict のみ block)と Layer3(systemd timer で pull+push)は seam bin/bdw-sync に集約(un-10h5)。fail-closed(lock dir 確保不能なら write せず exit 1・/tmp fallback 無し)。self-contained は serializer 核 bin/bdw に限定(外部 lib を source しない・bdw-sync は subprocess 呼出し)。"
 }

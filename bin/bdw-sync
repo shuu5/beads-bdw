@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+# bdw-sync — bd dolt 同期プリミティブ(bd write 協調 hook の Layer1/Layer3 の共有 seam)。
+#
+# PROVENANCE ───────────────────────────────────────────────────────────────────
+# un-10h5(bd write 協調 hook 3層)Leg-A の Layer1 core。単一 writer 規律(runbook §1.1
+# 「bd 書込は常に1マシン」)を「全機 bd write 可+協調規律」へ転換する grill 決定
+# (doobidoo 1495aeca 決定2・2026-07-14 合意)の機械実装。配置確定 A′=beads-bdw 拡張
+# (契約=scriptorium orch-klca / bd un-10h5 notes)。
+#
+# ROLE(seam) ────────────────────────────────────────────────────────────────────
+#   Layer1: bin/bdw が WRITE の直前(flock 保持中)に `bdw-sync pull-if-stale` を subprocess
+#           で呼ぶ。stale(=前回同期から閾値超過)なら自台帳を `bd dolt pull` し、鮮度を
+#           更新する。genuine な merge-conflict のみ block(exit 3)、他(transient/offline/
+#           remote 未設定)は degrade(exit 0)で write を通す。
+#   Layer3: systemd user timer が `bdw-sync pull-push --lock --repo <root>` を周期起動し、
+#           セッション非依存に pull+push する(per-machine push authority の一次)。
+#   Layer4(将来): scriptorium クロス連絡の push イベントで同じ入口(pull-if-stale/pull-push)
+#           を叩けるよう、Layer1-3 が呼ぶ入口を本 script 1 つに集約する(invariant④ の seam)。
+#
+# WHY(単一 writer からの転換) ────────────────────────────────────────────────────
+#   embedded Dolt は single-writer だが、各機が「書く前に自台帳を pull・書いたら push」を
+#   守れば全機が書ける。人手規律を hook で機械化するのが本 3 層。Layer1 は「書く前 pull」を
+#   WRITE 直前に自動化し、stale read-modify-write による cross-machine lost-update を防ぐ。
+#
+# 不変条件(un-10h5 契約の 8 項のうち本 seam が担う分) ───────────────────────────────
+#   ① 自台帳への `bd dolt pull`/`bd dolt push` のみ(cwd の台帳・foreign -C/--db/--global は付けない)。
+#      cross-ledger hydrate(bd repo sync/repo add)は一切呼ばない。
+#   ④ Layer1-3 の同期入口を本 script 1 つへ集約(Layer4 が同一入口を呼べる seam)。
+#   ⑤ throttle marker は L1/L3 で閾値共有(同一 marker file)かつ orch-hydrate の
+#      .beads/last-sync とは disjoint な別 namespace($HOME/.cache/bdw-locks 配下)。
+#   ⑥ 失敗挙動: transient(offline/unreachable/その他非 0)= warn+degrade(exit 0・write 続行)、
+#      genuine merge-conflict のみ block+loud(exit 3・復旧2段は下記 CONFLICT 参照)。
+#   ⑦ 全台帳 graceful no-op: remote 未設定 / .beads 不在 / git 外は silent-skip(exit 0)。
+#
+# EXIT CODES ─────────────────────────────────────────────────────────────────────
+#   0 = OK / noop(remote 未設定 等) / transient degrade(warn 済・write 続行可)
+#   3 = genuine merge conflict(呼び手=bin/bdw は WRITE を block すべき・fail-closed)
+#   1 = usage error(未知 subcommand 等)
+#   ※ bin/bdw は「exit 3 のみ block・それ以外は proceed」で分岐する(下流の分類詳細に依存しない)。
+#
+# ENV(任意) ─────────────────────────────────────────────────────────────────────
+#   BDW_BD_BIN              bd 実体(既定: PATH 上の bd)。selftest は fake bd stub を差す。
+#   BDW_LOCK_DIR            lock/marker 配置 dir(既定: $HOME/.cache/bdw-locks=マシン共通固定絶対パス)。
+#   BDW_SYNC_THROTTLE_SECS  freshness 閾値秒(既定: 900=15min・Layer3 timer 周期と共有)。
+#   BDW_SYNC_MARKER         throttle marker の明示上書き(既定: <lock_dir>/bd-sync-<repo_id>.marker)。
+#   BDW_SYNC_DISABLE        =1 で本 seam 全体を no-op(exit 0)。緊急 kill-switch。
+#   BDW_SYNC_NET_TIMEOUT_SECS  ネットワーク I/O(pull/push/remote list)の上限秒(既定: 30・0 で無効)。
+#                           Layer1 は flock 保持中に pull するため、ハング remote が machine-wide
+#                           臨界区間を無限保持し他 writer を巻き込むのを防ぐ(timeout 到達=TRANSIENT degrade)。
+#
+# CONFLICT(genuine merge-conflict の復旧・invariant⑥) ───────────────────────────────
+#   `bd dolt pull` が「merge conflicts ... require operator resolution; merge aborted」を返す=
+#   同一行の cross-machine 分岐編集(唯一の実証済み衝突モード=同一 issue 同一列への並行追記)。
+#   working set は復元済み(abort されるため台帳は壊れない)。復旧2段:
+#     (1) 既定 = bootstrap 再 hydrate(remote の権威側で上書きし直す)。
+#     (2) 上位 = dolt CLI で手動 merge 解決。
+#   手順詳細は guard の stderr banner / PRIME が案内する(本 seam は block+loud に留める)。
+
+set -uo pipefail
+
+readonly BDW_SYNC_EXIT_CONFLICT=3
+
+# --- 自己 dir 解決(sibling bin/bdw を lock-file 問い合わせに使う) ------------------------
+_SYNC_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P || printf '%s' ".")"
+
+BD_BIN="${BDW_BD_BIN:-bd}"
+
+# --- ネットワーク I/O の有界化(finding un-10h5・major) --------------------------------
+# Layer1 は flock(fd9)保持中に `bd dolt pull` を実行する=machine-wide 臨界区間にネットワーク
+# 待ちが初めて入る。https 等の remote が clean fail せず遅延/ハングすると pull が classify_pull
+# まで到達できず degrade できないまま flock を握り続け、同一 repo の他 writer が BDW_LOCK_TIMEOUT
+# 超過で一斉に fail-closed するカスケードが起こりうる。そこで pull/push/remote list を `timeout`
+# で有界化する。timeout 到達(rc 124/137)は出力が conflict/noremote いずれの signal にも当たらず
+# classify_pull が TRANSIENT へ落とす=exit0 degrade(flock を無限保持しない)。
+# `timeout` 不在の環境では素通し(graceful・fail-open)。BDW_SYNC_NET_TIMEOUT_SECS=0 でも無効化。
+bd_net() {
+  local t="${BDW_SYNC_NET_TIMEOUT_SECS:-30}"
+  if [ "$t" != "0" ] && command -v timeout >/dev/null 2>&1; then
+    timeout -k 5 "$t" "$@"
+  else
+    "$@"
+  fi
+}
+
+# --- lock dir 解決(bin/bdw と同一既定・self-contained) --------------------------------
+resolve_lock_dir() {
+  if [ -n "${BDW_LOCK_DIR:-}" ]; then printf '%s' "$BDW_LOCK_DIR"; return 0; fi
+  [ -z "${HOME:-}" ] && return 1
+  printf '%s' "${HOME}/.cache/bdw-locks"
+}
+
+# --- repo-id 解決(marker 鍵。bin/bdw の resolve_repo_id と同一算出=物理 DB と 1 対 1) -------
+# anchor + 全 worktree は git common-dir 経由で物理 1 DB を共有し同一 repo_id に収束する。
+# marker file は lock file と別名(bd-sync-* vs bd-write-*)ゆえ、両者の repo_id 算出が万一
+# drift しても serialization は壊れない(別 file)。本 script 内は L1/L3 とも同一 cwd→同一 marker。
+resolve_repo_id() {
+  local common_dir key_src
+  common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  [ -z "$common_dir" ] && common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+  if [ -n "$common_dir" ]; then
+    common_dir="$(cd "$common_dir" 2>/dev/null && pwd -P || printf '%s' "$common_dir")"
+  fi
+  key_src="${common_dir:-$PWD}"
+  printf '%s' "$key_src" | sha256sum | cut -c1-16
+}
+
+# --- throttle marker path 解決 ---------------------------------------------------------
+# 明示上書き(BDW_SYNC_MARKER)優先。既定は <lock_dir>/bd-sync-<repo_id>.marker。
+# ★invariant⑤: 名前は必ず bd-sync-* とし、.beads/last-sync・.beads/last-touched・
+#   .beads/scribe-heartbeat・.beads/export-state.json(禁則集合)と disjoint。配置も
+#   .beads/ でなく $HOME/.cache/bdw-locks(sandbox でも書ける・orch-hydrate と別 namespace)。
+resolve_marker() {
+  if [ -n "${BDW_SYNC_MARKER:-}" ]; then printf '%s' "$BDW_SYNC_MARKER"; return 0; fi
+  local ld rid
+  ld="$(resolve_lock_dir)" || return 1
+  rid="$(resolve_repo_id)"
+  printf '%s/bd-sync-%s.marker' "$ld" "$rid"
+}
+
+throttle_secs() { printf '%s' "${BDW_SYNC_THROTTLE_SECS:-900}"; }
+
+# marker の mtime を now に更新(dir が無ければ作る。失敗は fail-open=throttle が効かないだけ)。
+touch_marker() {
+  local m; m="$(resolve_marker)" || return 0
+  mkdir -p "$(dirname "$m")" 2>/dev/null || return 0
+  : >"$m" 2>/dev/null || true
+}
+
+# marker が閾値内(fresh)なら 0、stale/不在なら 1 を返す。
+marker_is_fresh() {
+  local m age thr; m="$(resolve_marker)" || return 1
+  [ -e "$m" ] || return 1
+  local mtime now; mtime="$(stat -c %Y "$m" 2>/dev/null || echo 0)"
+  now="${EPOCHSECONDS:-$(date +%s)}"; age=$(( now - mtime )); thr="$(threshold_or_secs)"
+  [ "$age" -lt "$thr" ]
+}
+threshold_or_secs() { throttle_secs; }
+
+# --- remote 設定の有無(graceful no-op 判定・invariant⑦) ------------------------------
+# `bd dolt remote list` が「No remotes configured.」を含めば remote 未設定=同期対象外。
+# git 外 / .beads 不在も remote 無しと同義(list が非 0 or 空)→ no-op。
+has_remote() {
+  local out
+  out="$(bd_net "$BD_BIN" dolt remote list 2>&1)" || return 1
+  printf '%s' "$out" | grep -qi 'No remotes configured' && return 1
+  # 少なくとも 1 行の remote エントリ(name url 形式)があるか。
+  printf '%s' "$out" | grep -qE '^[[:alnum:]_.-]+[[:space:]]+[a-z]+://' && return 0
+  return 1
+}
+
+# --- pull 出力の分類(verified 実測 signal・un-10h5 probe) --------------------------------
+# 入力: pull の rc と結合出力(stdout+stderr)。返り値(echo): OK / NOREMOTE / CONFLICT / TRANSIENT。
+#   rc==0                                             -> OK
+#   "no remote" / "No remotes configured"             -> NOREMOTE(graceful no-op)
+#   "merge conflict" / "require operator resolution"
+#     / "merge aborted"                               -> CONFLICT(genuine・block)
+#   その他 rc!=0                                       -> TRANSIENT(degrade)
+classify_pull() {
+  local rc="$1" out="$2"
+  if [ "$rc" -eq 0 ]; then printf 'OK'; return; fi
+  if printf '%s' "$out" | grep -qiE 'no remote|No remotes configured'; then printf 'NOREMOTE'; return; fi
+  if printf '%s' "$out" | grep -qiE 'merge conflict|require operator resolution|merge aborted'; then printf 'CONFLICT'; return; fi
+  printf 'TRANSIENT'
+}
+
+# --- git/bd repo かどうかの前提チェック(invariant⑦ graceful no-op) --------------------
+# git 外 or .beads 不在は同期対象外(silent skip)。auto-export の silent-skip と同型。
+in_syncable_repo() {
+  git rev-parse --git-dir >/dev/null 2>&1 || return 1
+  local root
+  root="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  [ -n "$root" ] && root="$(cd "$root" 2>/dev/null && dirname "$(pwd -P)")"
+  [ -n "$root" ] && [ -d "$root/.beads" ] && return 0
+  [ -d ".beads" ] && return 0
+  return 1
+}
+
+# --- 実 pull(throttle は見ない・分類して行動する。invariant①=自台帳のみ・foreign flag 無し) ---
+# 返り値 exit code: 0=OK/NOREMOTE/TRANSIENT(=呼び手は proceed) / 3=CONFLICT(=呼び手は block)。
+# ★finding un-10h5(major): no-op early-return(git 外/.beads 不在 / remote 未設定)でも touch_marker
+#   する。さもないと remote 未設定台帳(=Leg-A の graceful no-op 対象・多くの consumer の既定状態)では
+#   marker が永久に不在→marker_is_fresh 常に false→全 bd WRITE が flock 保持中に毎回 in_syncable_repo
+#   +has_remote(`bd dolt remote list` ~0.2s)を再 probe する hot-path 回帰になる。marker を触れば
+#   invariant⑤ の throttle が『remote 未設定の判定コスト』も閾値窓に 1 回へ絞る。remote が後から
+#   設定されても遅延は最大で throttle 窓ぶんに留まり Layer3 timer/次周期で回収される(安全)。
+do_pull() {
+  if ! in_syncable_repo; then touch_marker; return 0; fi   # ⑦ git 外/.beads 不在 → silent no-op(probe も throttle)
+  if ! has_remote; then touch_marker; return 0; fi         # ⑦ remote 未設定 → silent no-op(probe も throttle)
+  local out rc verdict
+  # ★invariant①: 自台帳のみ。`bd dolt pull` を cwd で実行し -C/--db/--global を一切付けない。
+  out="$(bd_net "$BD_BIN" dolt pull 2>&1)"; rc=$?
+  verdict="$(classify_pull "$rc" "$out")"
+  case "$verdict" in
+    OK)       touch_marker; return 0 ;;
+    NOREMOTE) touch_marker; return 0 ;;           # ⑦ 途中で remote が消えた等 → no-op
+    CONFLICT)                                      # ⑥ genuine → block+loud(marker は触らず毎回 surface)
+      {
+        echo "bdw-sync: GENUINE merge conflict on self-ledger pull — WRITE を block します(fail-closed)。"
+        echo "bdw-sync: 同一行の cross-machine 分岐編集(唯一の実証済み衝突モード)。working set は復元済み。"
+        echo "bdw-sync: 復旧 = (1) bootstrap 再 hydrate(既定・remote 権威で上書き) / (2) dolt CLI 手動 merge。"
+        echo "bdw-sync: --- bd dolt pull 出力 ---"
+        printf '%s\n' "$out" | sed 's/^/bdw-sync:   /'
+      } >&2
+      return "$BDW_SYNC_EXIT_CONFLICT" ;;
+    TRANSIENT)                                     # ⑥ transient → warn+degrade(exit 0・timer 回収)
+      touch_marker
+      {
+        echo "bdw-sync: pull transient failure(offline/unreachable 等)— degrade して WRITE を続行します。"
+        echo "bdw-sync: 鮮度は Layer3 timer / 次回同期で回収されます。--- 出力 ---"
+        printf '%s\n' "$out" | sed 's/^/bdw-sync:   /'
+      } >&2
+      return 0 ;;
+  esac
+}
+
+# --- 実 push(pull-push 用。push 失敗は transient 扱い=warn only・invariant⑥) -----------
+do_push() {
+  if ! in_syncable_repo; then return 0; fi
+  if ! has_remote; then return 0; fi
+  local out rc
+  out="$(bd_net "$BD_BIN" dolt push 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    {
+      echo "bdw-sync: push failed(transient 扱い)— 次回 timer で回収します。--- 出力 ---"
+      printf '%s\n' "$out" | sed 's/^/bdw-sync:   /'
+    } >&2
+  fi
+  return 0
+}
+
+# --- --lock: sibling bin/bdw に lock-file を問い合わせ、その flock 下で fn を実行 ----------
+# Layer3(timer)は worker の WRITE と直列化するため、bin/bdw と同一 lock file を掴む。
+# bin/bdw が見つからない/問い合わせ失敗は best-effort で no-lock 実行(warn)。
+# ★finding un-10h5(major): 1 回の run_locked は必ず「単一の dolt network op」だけを保持する。
+#   pull-push を 1 つの flock で直列に回すと pull(~net)+push(~net)=最悪 2×net_timeout 保持し、
+#   worker 側の flock 待ち BDW_LOCK_TIMEOUT(既定 60s)を超えて共有サーバーの worker WRITE を
+#   一斉に fail-closed させうる。そこで pull-push --lock は pull と push を別々の run_locked に分割し
+#   (pull_push_locked)、machine-wide 臨界区間の 1 回あたり保持を単一 op(~net_timeout)に抑える。
+#   制約: BDW_SYNC_NET_TIMEOUT_SECS(+ -k grace)< worker BDW_LOCK_TIMEOUT を保つこと(INSTALL.md に明記)。
+run_locked() {
+  local fn="$1"; shift
+  local lf=""
+  if [ -x "$_SYNC_DIR/bdw" ]; then
+    lf="$("$_SYNC_DIR/bdw" lock-file 2>/dev/null || true)"
+  fi
+  if [ -z "$lf" ]; then
+    echo "bdw-sync: lock-file を解決できず no-lock で実行します(best-effort)。" >&2
+    "$fn" "$@"; return $?
+  fi
+  mkdir -p "$(dirname "$lf")" 2>/dev/null || true
+  exec 8>"$lf" || { echo "bdw-sync: cannot open lock file: $lf — no-lock 実行" >&2; "$fn" "$@"; return $?; }
+  flock -w "${BDW_LOCK_TIMEOUT:-60}" 8 || { echo "bdw-sync: flock 取得失敗 — skip(次回 timer で回収)" >&2; return 0; }
+  "$fn" "$@"
+}
+
+# ═══ subcommand dispatch ═══════════════════════════════════════════════════════════
+[ "${BDW_SYNC_DISABLE:-}" = "1" ] && exit 0
+
+sub="${1:-}"; [ "$#" -ge 1 ] && shift
+
+# 共通オプション: --repo <path>(cd 先) / --lock(自 flock)。
+REPO=""; USE_LOCK=false
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --repo) REPO="${2:-}"; shift 2 ;;
+    --repo=*) REPO="${1#*=}"; shift ;;
+    --lock) USE_LOCK=true; shift ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+if [ -n "$REPO" ]; then
+  cd "$REPO" 2>/dev/null || { echo "bdw-sync: --repo '$REPO' に cd できません" >&2; exit 1; }
+fi
+
+# command -v で bd 実体を確認(READ 系の has_remote すら呼べない環境は no-op)。
+if ! command -v -- "$BD_BIN" >/dev/null 2>&1; then
+  echo "bdw-sync: bd executable not found (BDW_BD_BIN=$BD_BIN) — no-op" >&2
+  exit 0
+fi
+
+pull_if_stale_impl() {
+  if marker_is_fresh; then return 0; fi   # ⑤ fresh(閾値内)なら pull せず即 proceed
+  do_pull
+}
+pull_push_impl() { do_pull || return $?; do_push; }
+# ★finding un-10h5(major): --lock 時は pull と push を別々の flock 区間に分割し、machine-wide
+#   臨界区間の 1 回あたり保持を単一 dolt op(~net_timeout)に抑える(2×net で worker を fail-closed
+#   させない)。pull が conflict(3)なら push せず 3 を伝播(pull_push_impl と同じ短絡)。flock 取得に
+#   失敗した op は run_locked が 0(skip)を返すため次周期の timer で回収される。
+pull_push_locked() {
+  local rc
+  run_locked do_pull; rc=$?
+  [ "$rc" -ne 0 ] && return "$rc"   # conflict(3)は push せず伝播 / flock-skip(0)は push へ進む
+  run_locked do_push
+}
+
+# --- インライン自己テスト(classifier の決定検証・bd/dolt 非依存・fail-closed) --------------
+# classify_pull の 4 分類が verified signal に対して正しく写像することを機械 pin する。
+# 実 dolt 衝突を要さず決定的。tests/bdw-sync.bats がこれを含む網羅版を回す(併存)。
+self_test() {
+  local fails=0 got
+  _st() { # $1=期待 $2=rc $3=out $4=ラベル
+    got="$(classify_pull "$2" "$3")"
+    if [ "$got" = "$1" ]; then echo "ok   [$4] -> $got"
+    else echo "FAIL [$4] expected=$1 got=$got"; fails=$((fails+1)); fi
+  }
+  _st OK        0 "Pulling from Dolt remote...\nPull complete."                                      "up-to-date"
+  _st NOREMOTE  1 "Error: fetch from origin/main: Error 1105: no remote"                             "no-remote"
+  _st CONFLICT  1 "Error: merge origin/main: merge conflicts in issues require operator resolution; merge aborted and working set restored" "genuine-conflict"
+  _st TRANSIENT 1 "Error: fetch from origin/main: Error 1105: fetch failed: no branches found in remote 'origin'" "unreachable-transient"
+  _st TRANSIENT 1 "Error: dial tcp: connection refused"                                              "network-transient"
+  # marker 名が禁則集合と disjoint(⑤)を静的 pin
+  local m; m="$(BDW_LOCK_DIR=/tmp/bdw-st resolve_marker 2>/dev/null || true)"
+  case "$m" in
+    */.beads/last-sync|*/.beads/last-touched|*/.beads/scribe-heartbeat|*/.beads/export-state.json)
+      echo "FAIL [marker-disjoint] marker が禁則名: $m"; fails=$((fails+1)) ;;
+    */bd-sync-*.marker) echo "ok   [marker-disjoint] $m" ;;
+    *) echo "FAIL [marker-disjoint] 想定外 marker 形: $m"; fails=$((fails+1)) ;;
+  esac
+  echo "----"
+  if [ "$fails" -eq 0 ]; then echo "bdw-sync self-test: PASS"; return 0
+  else echo "bdw-sync self-test: FAIL ($fails)"; return 1; fi
+}
+
+case "$sub" in
+  pull-if-stale)
+    if [ "$USE_LOCK" = true ]; then run_locked pull_if_stale_impl; else pull_if_stale_impl; fi ;;
+  pull)   # throttle を無視して必ず pull(手動/Layer4 用)
+    if [ "$USE_LOCK" = true ]; then run_locked do_pull; else do_pull; fi ;;
+  push)
+    if [ "$USE_LOCK" = true ]; then run_locked do_push; else do_push; fi ;;
+  pull-push)
+    # --lock は pull/push を別々の flock 区間に分割(hold≤1×net_timeout・finding un-10h5)。
+    if [ "$USE_LOCK" = true ]; then pull_push_locked; else pull_push_impl; fi ;;
+  marker-path)  # 問い合わせ: 解決した marker 絶対パスを stdout(selftest/consumer 用)
+    m="$(resolve_marker)" || { echo "bdw-sync: HOME/BDW_LOCK_DIR 未設定で marker 解決不能" >&2; exit 1; }
+    printf '%s\n' "$m" ;;
+  --self-test|selftest)
+    self_test ;;
+  ""|-h|--help|help)
+    sed -n '2,60p' "$0"; exit 0 ;;
+  *)
+    echo "bdw-sync: unknown subcommand '$sub'" >&2; exit 1 ;;
+esac

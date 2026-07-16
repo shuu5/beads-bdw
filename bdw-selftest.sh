@@ -53,6 +53,20 @@ command -v jq >/dev/null 2>&1 || { echo "FAIL: jq not on PATH"; exit 1; }
 [ -x "$BDW" ] || { echo "FAIL: $BDW not found/executable"; exit 1; }
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/bdw-selftest-XXXXXX")"
+
+# lock dir writability preflight(sandbox 対応): 既定 lock dir が書けない環境(OS sandbox の
+# RO-bind 等)では throwaway repo の lock file を作れず全 WRITE が fail-closed になる。BDW_LOCK_DIR
+# が未指定かつ既定 dir が書けない場合のみ、この harness 専用の書込可 temp lock dir へ退避する
+# (LOCKDIR 次元の「真の既定値」検証は別途 `env -u BDW_LOCK_DIR` で行うため退避の影響を受けない)。
+if [ -z "${BDW_LOCK_DIR:-}" ]; then
+  _def_ld="${HOME:-/tmp}/.cache/bdw-locks"
+  if ! ( mkdir -p "$_def_ld" 2>/dev/null && : >"$_def_ld/.bdw-selftest-wtest.$$" 2>/dev/null ); then
+    export BDW_LOCK_DIR="$TMP/locks"
+    echo "  (note) 既定 lock dir が書込不可 → harness 用 BDW_LOCK_DIR=$BDW_LOCK_DIR に退避(sandbox 対応)"
+  else
+    rm -f "$_def_ld/.bdw-selftest-wtest.$$" 2>/dev/null
+  fi
+fi
 HOLDER_PID=""        # READ-under-lock テストで lock を保持する背景プロセス
 LOCK_FILE=""         # その throwaway repo 用 lock(bdw と同じ固定 lock dir 配下)
 KEEP_MARKER=""       # これを消すと holder は自走終了(orphan sleep を残さない)
@@ -76,7 +90,9 @@ echo "  GUARDBN   : basename='$(basename "$BDW")' (guard 素通し条件 != bd) 
 # bd を呼ばない問い合わせ経路。既定(BDW_LOCK_DIR 未設定)で $HOME/.cache/bdw-locks を返すこと、
 # および BDW_LOCK_DIR 明示時にそれを返すことの両方を確認する。
 lockdir_ok=false
-ld_default="$("$BDW" lock-dir 2>/dev/null)"; rc_def=$?
+# 「真の既定値」は BDW_LOCK_DIR を明示的に外した clean env で検証する(harness が sandbox 退避で
+# BDW_LOCK_DIR を設定していても、既定解決 $HOME/.cache/bdw-locks の検証意図を壊さない)。
+ld_default="$(env -u BDW_LOCK_DIR "$BDW" lock-dir 2>/dev/null)"; rc_def=$?
 ld_override="$(BDW_LOCK_DIR=/tmp/bdw-selftest-override-dir "$BDW" lock-dir 2>/dev/null)"; rc_ovr=$?
 if [ "$rc_def" -eq 0 ] && [ "$ld_default" = "$HOME/.cache/bdw-locks" ] \
    && [ "$rc_ovr" -eq 0 ] && [ "$ld_override" = "/tmp/bdw-selftest-override-dir" ]; then
