@@ -17,6 +17,7 @@
 #   ① 自台帳のみ        : M6 pull に -C /foreign を注入            : invariant1-self-only
 #   bdw block          : M7 bin/bdw の exit3 block を無効化       : bdw-block
 #   Layer3 lock 直列化 : M8 run_locked の flock 失敗 skip を反転   : lock-coordination
+#   ⑦ 複合 scheme 認識 : M9 scheme 照合を旧 [a-z]+:// へ revert    : scheme-git-https
 
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
@@ -109,6 +110,14 @@ run_mutant M7-no-block bdw \
 run_mutant M8-lock-fail-open bdw-sync \
   's/flock 取得失敗 — skip(次回 timer で回収)" >&2; return 0; }/flock 取得失敗 — skip(次回 timer で回収)" >\&2; : ; }/' \
   "lock-coordination" "run_locked-lock-fail"
+
+# M9: has_remote の scheme 照合を修正前の素朴な [a-z]+:// へ revert → 複合 scheme(git+https://)が
+#     NO-MATCH に戻り、remote 有りでも do_pull/do_push が no-op 枝に落ちて dolt を呼ばない(un-l3ln)。
+#     filter は非アンカーゆえ scheme-git-https-{pull,push} の両 case にマッチする(両方 FAIL するはず)。
+#     ＝「修正前 FAIL / 修正後 PASS」の対称実証(新 case の非空虚性の機械保証)。
+run_mutant M9-scheme-revert bdw-sync \
+  's#\[a-z\]\[A-Za-z0-9+.-\]\*://#[a-z]+://#' \
+  "scheme-git-https" "⑦scheme-composite"
 
 echo "----" | tee -a "$LOG"
 if [ "$fails" -eq 0 ]; then

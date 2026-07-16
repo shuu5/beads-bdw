@@ -29,7 +29,9 @@ setup() {
 printf '%s\n' "$*" >> "$CALLS"
 case "$*" in
   "dolt remote list")
-    if [ "${FAKE_REMOTE:-yes}" = yes ]; then echo "origin               file:///fake/bare"; else echo "No remotes configured."; fi
+    # FAKE_REMOTE_URL: remote の URL を case 側から差し替える口(既定は file:// を温存=既存 case 不変)。
+    # 実 fleet の dolt remote は git+https:// 形式ゆえ scheme 照合の被覆に必須(un-l3ln)。
+    if [ "${FAKE_REMOTE:-yes}" = yes ]; then printf 'origin               %s\n' "${FAKE_REMOTE_URL:-file:///fake/bare}"; else echo "No remotes configured."; fi
     exit 0 ;;
   "dolt pull"*)
     printf '%s\n' "${FAKE_PULL_OUT:-Pull complete.}"; exit "${FAKE_PULL_RC:-0}" ;;
@@ -70,6 +72,44 @@ STUBEOF
   [ "$status" -eq 0 ]
   [ -z "$output" ]                          # warn を出さない
   ! grep -q "dolt pull" "$CALLS"            # pull を試みない
+}
+
+# ─── scheme 照合: 複合 scheme(git+https://)の remote を remote 有りと認識する ──────────
+# un-l3ln: has_remote の scheme grep が [a-z]+:// だった頃、fleet の実 remote(全て
+# git+https://)は "+" に到達できず NO-MATCH → do_pull/do_push が no-op 枝(touch_marker して
+# return 0)に常時落ち、一度も実 pull せず marker だけ touch して fresh を偽装していた。
+# 既存 case は fake stub が file:///fake/bare(旧 pattern が唯一 MATCH する scheme)を吐くため
+# このバグに構造的に盲目だった。ゆえに以下の assert は exit code でなく「CALLS に dolt pull が
+# 記録されたか」に置く(bd 不在/stub 未起動でも touch_marker して exit 0 に落ちる fail-open が
+# あり、exit 0 だけを見ると vacuous に緑化するため)。
+@test "scheme-git-https-pull: git+https:// remote は has_remote=true で実 pull 分岐へ到達する" {
+  run env FAKE_REMOTE=yes FAKE_REMOTE_URL="git+https://github.com/shuu5/ubuntu-note-system.git" \
+      FAKE_PULL_RC=0 BDW_BD_BIN="$STUB" CALLS="$CALLS" BDW_LOCK_DIR="$BDW_LOCK_DIR" \
+      bash -c 'cd "'"$WORK"'" && "'"$SYNC"'" pull'
+  [ "$status" -eq 0 ]
+  grep -q '^dolt pull$' "$CALLS"            # load-bearing: no-op 枝でなく実 pull へ到達した
+}
+
+# do_push も同一 has_remote を共有する(Layer3 pull-push=:219)。1 行修正で Layer1/Layer3 の
+# 両経路が回復することを push 側でも pin する。
+@test "scheme-git-https-push: git+https:// remote は Layer3 pull-push で push まで到達する" {
+  run env FAKE_REMOTE=yes FAKE_REMOTE_URL="git+https://github.com/shuu5/ubuntu-note-system.git" \
+      FAKE_PULL_RC=0 FAKE_PUSH_RC=0 BDW_BD_BIN="$STUB" CALLS="$CALLS" BDW_LOCK_DIR="$BDW_LOCK_DIR" \
+      bash -c 'cd "'"$WORK"'" && "'"$SYNC"'" pull-push'
+  [ "$status" -eq 0 ]
+  grep -q '^dolt pull$' "$CALLS"            # Layer1 経路
+  grep -q '^dolt push$' "$CALLS"            # Layer3 経路(同一 has_remote 共有)
+}
+
+# negative control: scheme 照合を緩めすぎて "No remotes configured." 等を remote 有りと
+# 誤認しないこと(⑦ の graceful no-op を壊さない)は invariant7-noremote が担う。
+# 追加の over-match 制御として、URL でない行(scheme 無し)を remote 有りと読まないことを pin。
+@test "scheme-no-url: scheme を持たない行は remote 有りと誤認しない(over-match 制御)" {
+  run env FAKE_REMOTE=yes FAKE_REMOTE_URL="not-a-url-just-text" \
+      FAKE_PULL_RC=0 BDW_BD_BIN="$STUB" CALLS="$CALLS" BDW_LOCK_DIR="$BDW_LOCK_DIR" \
+      bash -c 'cd "'"$WORK"'" && "'"$SYNC"'" pull'
+  [ "$status" -eq 0 ]
+  ! grep -q '^dolt pull$' "$CALLS"          # URL でない=remote 無し扱いで no-op
 }
 
 # ─── OK: rc0 pull → exit 0・marker touched ───────────────────────────────────────
@@ -221,6 +261,47 @@ _need_real_tools() {
       bash -c 'cd "'"$A"'" && "'"$SYNC"'" pull-if-stale'
   ( cd "$A" && bd dolt stop >/dev/null 2>&1 ) || true
   [ "$status" -eq 0 ]
+}
+
+# ─── real e2e: 実 bd が吐く git+file:// remote で has_remote=true → 実 pull へ到達 ─────
+# un-l3ln の非空虚な real proof。fake stub でなく実 bd の `dolt remote list` 出力
+# (= "origin               git+file:///…" の実文言・git+ prefix 保持)に対して scheme 照合が
+# 通ることを実測する。fleet の実 remote は git+https:// だが cell は network 遮断ゆえ
+# classify が TRANSIENT に degrade する(=判定が濁る)。git+file:// は同じ複合 scheme 形状を
+# 保ったまま loopback で完結するため、offline・決定的に real pull を観測できる。
+# 実 bd を使いつつ「実 pull へ到達したか」を観測するため、argv を CALLS に記録してから実 bd を
+# exec する wrapper を BDW_BD_BIN に差す(挙動は実 bd のまま=canned でない)。exit 0 は no-op 枝
+# でも成立する(fail-open)ため、load-bearing assert は CALLS の '^dolt pull$' に置く。
+@test "e2e-scheme-git-file: 実 bd の git+file:// remote で実 pull 分岐へ到達する" {
+  _need_real_tools || return 1
+  RP="$BATS_TEST_TMPDIR/gitfile"; BARE="$RP/bare"; A="$RP/a"; SEED="$RP/seed"; mkdir -p "$A" "$SEED"
+  # git+file:// は dolt ネイティブ remote(file://=単なる dir)と違い「git リポジトリ」を指す
+  # (mirror-export 経路)。ゆえに bare は実 git repo かつ初期 branch/commit を持つ必要がある
+  # (未 seed だと bd が『git remote has no branches』で fetch/push を拒む=実測)。
+  git init --bare -q -b main "$BARE"
+  ( cd "$SEED" && git init -q -b main && git config user.email t@e.com && git config user.name t \
+    && echo seed > README && git add README && git commit -qm init && git push -q "$BARE" main )
+  ( cd "$A" && git init -q && git config user.email t@e.com && git config user.name t && bd init >/dev/null 2>&1 \
+    && bd create --title seed >/dev/null 2>&1 && bd dolt remote add origin "git+file://$BARE" >/dev/null 2>&1 \
+    && bd dolt push >/dev/null 2>&1 )
+  # 実 remote list が git+ prefix を保った複合 scheme を吐いていることを直接 pin(前提の実測)。
+  run bash -c 'cd "'"$A"'" && bd dolt remote list 2>/dev/null'
+  [[ "$output" == *"git+file://"* ]]
+  # 記録 wrapper: argv を CALLS に残して実 bd へ委譲する(canned 出力を挟まない)。
+  REALBD="$(command -v bd)"
+  WRAP="$BATS_TEST_TMPDIR/bd-wrap"
+  cat > "$WRAP" <<WRAPEOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$CALLS"
+exec "$REALBD" "\$@"
+WRAPEOF
+  chmod +x "$WRAP"
+  : >"$CALLS"
+  run env BDW_BD_BIN="$WRAP" CALLS="$CALLS" BDW_LOCK_DIR="$BATS_TEST_TMPDIR/gflocks" BDW_SYNC_THROTTLE_SECS=0 \
+      bash -c 'cd "'"$A"'" && "'"$SYNC"'" pull-if-stale'
+  ( cd "$A" && bd dolt stop >/dev/null 2>&1 ) || true
+  [ "$status" -eq 0 ]                       # up-to-date な remote ゆえ OK 分類
+  grep -q '^dolt pull$' "$CALLS"            # load-bearing: no-op 枝でなく実 pull を実行した
 }
 
 @test "e2e-conflict: 実 bd の genuine merge conflict は exit 3(block)" {
