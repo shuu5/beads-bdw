@@ -1,0 +1,4 @@
+# 負例: nested YAML(sync: + 2space remote:)。実フリートは flat dotted-key ゆえ本形は no-match=NO。
+issue-prefix: "x"
+sync:
+  remote: "git+https://example.com/x.git"

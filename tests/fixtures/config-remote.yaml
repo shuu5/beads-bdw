@@ -1,0 +1,4 @@
+# 実フリートの remote-backed 台帳 format(col0 flat dotted-key・実測)。has_remote=YES(positive)。
+issue-prefix: "un"
+backup.git-push: false
+sync.remote: "git+https://github.com/shuu5/ubuntu-note-system.git"

@@ -1,0 +1,3 @@
+# 負例: indented(col0 でない)。^sync.remote: に no-match ゆえ has_remote=NO(loud FAIL 相当)。
+issue-prefix: "x"
+  sync.remote: "git+https://example.com/x.git"

@@ -1,0 +1,3 @@
+# 負例: commented。先頭 # ゆえ ^sync.remote: に no-match。has_remote=NO。
+issue-prefix: "x"
+# sync.remote: "git+https://example.com/x.git"

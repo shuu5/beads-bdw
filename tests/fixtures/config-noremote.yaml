@@ -1,0 +1,3 @@
+# remote 行皆無(journal-club-workbench 形=local-only)。has_remote=NO(graceful no-op positive)。
+issue-prefix: "jcw"
+backup.git-push: false
