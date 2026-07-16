@@ -1,0 +1,18 @@
+{
+  "_comment": "beads-bdw plugin の hooks 配線(un-37xq Leg-B)。CC auto-discover(plugin.json に hooks キー不要)。PreToolUse[Bash]=universal bd-write-guard.py。bare bd write を自台帳のみ・bdw funnel へ機械強制する(rule a/b/c・動的 self-prefix・has-remote gate・fail 2 段)。scribe hooks/hooks.json の guard entry 形式を踏襲。",
+  "_comment_guard": "PreToolUse[Bash]=bd-write-guard.py(universal)。SessionStart 系と違い command に `|| true` を付けない(guard の exit2=block を必ず伝播させるため。|| true を足すと guard が無効化される=禁止)。script 不在/非実行時のみ if/else で exit 0=fail-open(全 Bash を brick しない二重 fail-safe)。トークナイザは canonical cmdtokens plugin(~/.claude/plugins/cmdtokens/lib)を consume する。既存 2 guard(scribe sc / scriptorium orch の session-scoped guard)とは rollout 中併存(deny 冪等=CC は同 matcher の全 hook を実行し 1 つでも exit2 なら deny=net-safe)。rollout 順序 gate は un-wjzu。",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "SCRIPT=\"${CLAUDE_PLUGIN_ROOT}/scripts/hooks/bd-write-guard.py\"; if [ -x \"$SCRIPT\" ]; then python3 \"$SCRIPT\"; else exit 0; fi",
+            "timeout": 10000
+          }
+        ]
+      }
+    ]
+  }
+}

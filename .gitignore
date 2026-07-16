@@ -3,3 +3,7 @@
 *.local.sh
 *.local.log
 *.local.md
+
+# Python bytecode cache(guard/lib の実行副産物)
+__pycache__/
+*.pyc
