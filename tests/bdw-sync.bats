@@ -47,6 +47,19 @@ STUBEOF
   ( cd "$WORK" && git init -q && git config user.email t@e.com && git config user.name t && mkdir -p .beads )
 }
 
+# real e2e が起動した embedded dolt sql-server を **abort 経路でも** 確実に停める安全網。
+# bats は test body を set -e 相当で回すため、bare assert が落ちるとその行で test が abort し
+# 以降の inline cleanup(`bd dolt stop`)に到達しない → BATS_TEST_TMPDIR 削除後の deleted dir を
+# 掴んだ server が残留する。assert 失敗は「テストが検出目的を果たした瞬間」でもあるので、
+# 検出成功時にこそ leak するのは規約として整合しない。teardown は成功/失敗/abort に依らず
+# 走るためここへ集約する(inline の stop は即時解放として温存・stop は idempotent)。
+teardown() {
+  for _d in "${A:-}" "${B:-}"; do
+    [ -n "$_d" ] && [ -d "$_d" ] && ( cd "$_d" && bd dolt stop >/dev/null 2>&1 ) || true
+  done
+  return 0
+}
+
 # ─── ⑥ genuine conflict → exit 3(block) ────────────────────────────────────────
 @test "invariant6-conflict: genuine merge conflict は exit 3 (block)" {
   run env FAKE_REMOTE=yes FAKE_PULL_RC=1 \
