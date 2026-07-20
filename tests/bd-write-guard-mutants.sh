@@ -96,6 +96,49 @@ run_mutant M-f2-closed \
   'if remote is _REMOTE_UNKNOWN:' \
   'if False and remote is _REMOTE_UNKNOWN:  # MUTANT' "逸脱(3)fail-open(remote)"
 
+# M-append: SUBCMD_VAL_FLAGS から "--append-notes" を除去 → 値 gate-pending が positional 扱いになり
+#   self 更新が (c)→(b) へ反転(un-a0t9 の FP 再現)。値取り flag 登録が load-bearing である証明。
+run_mutant M-append \
+  '"--add-label", "--append-notes", "--await-id", "--body-file", "--defer",' \
+  '"--add-label", "--await-id", "--body-file", "--defer",  # MUTANT' "un-a0t9 値取り flag 網羅"
+
+# M-boolmoat: SUBCMD_VAL_FLAGS へ bool の "--claim" を注入 → 直後の foreign positional un-9 が値として
+#   食われ rule(b) が沈黙し (b)→(c) へ反転。moat pin(fail-closed→fail-open 反転検知)の非空虚性証明。
+run_mutant M-boolmoat \
+  '"--timeout", "--holder", "--coordinator",' \
+  '"--timeout", "--holder", "--coordinator", "--claim",  # MUTANT' "un-a0t9 fail-open 禁止(bool 混入)"
+
+# M-arity: subcmd 別 bool override を無効化 → edit/gate/mol の bool flag 直後の foreign が値として
+#   食われ (b)→(c) へ反転。arity 明示形(flat 集合では表現不能)の non-vacuity 証明。
+run_mutant M-arity \
+  'return SUBCMD_VAL_FLAGS - override if override else SUBCMD_VAL_FLAGS' \
+  'return SUBCMD_VAL_FLAGS  # MUTANT' "un-a0t9 subcmd 別 arity"
+
+# M-alias: subcmd alias 正規化を無効化 → `bd protomolecule show -p un-9` で override が外れ -p が
+#   foreign un-9 を値として食い (b)→(c) へ反転。alias 経路の fail-open 封鎖が load-bearing である証明。
+run_mutant M-alias \
+  'sub = SUBCMD_ALIASES.get(sub, sub)  # alias 経路で override が外れる fail-open を封鎖' \
+  'pass  # MUTANT' "un-a0t9 subcmd alias 正規化"
+
+# M-fromfile: rule(d) 汎化分岐を除去 → 対象 id を別ファイルに持つ write(delete --from-file /
+#   dep add --file / migrate issues --ids-file)が funnel(c) で素通り(fail-open)。分岐が load-bearing。
+run_mutant M-fromfile \
+  'if _external_id_source_flag(sub, operands) is not None:' \
+  'if False:  # MUTANT' "un-a0t9 外部 id ソース write の rule(d)"
+
+# M-extsibling: 汎化テーブルから兄弟経路(dep add --file)のみを除去 → delete は閉じたまま
+#   `bd dep add --file deps.jsonl` が (c) へ落ちる。delete 決め打ちに戻す退行の検知が非空虚である証明。
+run_mutant M-extsibling \
+  '"dep": {"--file"},' \
+  '# MUTANT' "un-a0t9 rule(d) 汎化(兄弟経路)"
+
+# M-idval: 値が bead id 自体になる flag(--of)を SUBCMD_VAL_FLAGS へ注入 → 値 un-9 が消費され foreign
+#   検査面から消えて (b)→(c) へ反転。id 値 flag 非登録=fail-closed pin の非空虚性証明。
+run_mutant M-idval \
+  '"--timeout", "--holder", "--coordinator",' \
+  '"--timeout", "--holder", "--coordinator", "--of", "--event-target", "--waits-for",  # MUTANT' \
+  "un-a0t9 id 値 flag 非登録(fail-closed)"
+
 echo "----" | tee -a "$LOG"
 if [ "$fails" -eq 0 ]; then
   echo "GUARD MUTANT DIFFERENTIAL: PASS(全 mutant が --self-test を FAIL させた=検証は非空虚)" | tee -a "$LOG"
