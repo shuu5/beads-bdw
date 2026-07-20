@@ -1,8 +1,10 @@
 # worker/scribe scratch(untracked・commit しない)
 .scribe-envprobe
 *.local.sh
+*.local.py
 *.local.log
 *.local.md
+*.local.json
 
 # Python bytecode cache(guard/lib の実行副産物)
 __pycache__/

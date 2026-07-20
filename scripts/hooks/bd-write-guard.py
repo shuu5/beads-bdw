@@ -108,12 +108,108 @@ CREATE_LIKE = {"create", "q", "create-form"}
 # self dolt funnel 対象(逸脱(2)): push/pull は flock 迂回 race を封鎖するため bdw funnel(c)。
 DOLT_FUNNEL = {"push", "pull"}
 
+# 値取り flag(次トークンを値として消費する)。write subcommand の `bd help <sub>` の型注記
+# (string/strings/int/stringArray)から網羅列挙する(証跡 probe: flagscan-un-a0t9.local.py)。
+# ★bool flag を入れてはならない: bool 直後の本物の foreign positional bead id が「値」として食われ
+#   rule(b) が沈黙する=fail-closed(安全側過剰 block)→fail-open(owner-2 moat すり抜け)への極性反転で
+#   元の FP より悪化する。禁止例: --claim --stdin --ephemeral --persistent --no-history --history
+#   --allow-empty-description --force --no-inherit-labels --sandbox。
+# ★値が bead id そのものになる flag は意図的に非登録: 値を消費すると当該 bead が foreign 検査面から
+#   消える。過剰 block(FP)は安全側だが取りこぼしは moat 破りゆえ、判断が割れる箇所は fail-closed に
+#   倒す(既登録の --parent/--blocked-by/--with は既存挙動として不変・本 bead の scope 外)。
+#   非登録の id 値 flag(probe 実測・write 面): --of(duplicate) / --blocks,-b(dep, gate create) /
+#   --id(admin compact, migrate issues) / --ids-file(migrate issues) / --issue-id(audit record) /
+#   --attach(mol pour) / --deps / --waits-for / --event-target。
+#   ★この非登録は self-test の [id 値 flag 非登録=fail-closed pin] 群と mutant M-idval が守る。
+#   網羅を仕上げる後続作業者へ: probe 出力を機械的に流し込むとこの集合が混入し、全 green のまま
+#   moat が破れる。追加時は必ず上記除外集合を差し引くこと。
+# ★arity 衝突により非登録(write 面で bool 用法を持つ): --check(doctor=値 / setup=bool) /
+#   --project(*-sync=値 / setup=bool) / --team(linear sync=値 / init=bool)。SUBCMD_BOOL_OVERRIDES で
+#   救えるが FP 実害が観測されていないため fail-closed 側に据え置く。
+# 網羅状況(verified): 上記 2 つの除外集合を除き、READ_SUBCMDS/HIGH_DANGER_WRITE/CREATE_LIKE 以外の
+# write subcommand に出現する値取り flag は全て登録済み(probe 出力と機械照合)。
 SUBCMD_VAL_FLAGS = {
     "--status", "-s", "--reason", "-r", "--priority", "-p", "--notes", "-n",
     "--assignee", "-a", "--owner", "--title", "-t", "--type", "--design",
     "--acceptance", "--message", "-m", "--with", "--label", "-l", "--milestone",
     "--parent", "--estimate", "--actor", "--limit", "--format", "--sort",
     "--from", "--to", "--depends-on", "--blocked-by", "--description", "-d",
+    # update(un-a0t9 floor)
+    "--add-label", "--append-notes", "--await-id", "--body-file", "--defer",
+    "--design-file", "--due", "--external-ref", "--metadata", "--remove-label",
+    "--session", "--set-labels", "--set-metadata", "--spec-id", "--unset-metadata", "-e",
+    # create(複数形 --labels は単数 --label と別 flag) / close / comment / note / dep add / delete
+    "--labels", "--reason-file", "--file", "--from-file",
+    # gate create / merge-slot acquire / swarm create
+    "--timeout", "--holder", "--coordinator",
+    # ↓ 残余 write subcommand の網羅(probe 出力と機械照合・上記除外集合は差し引き済み)
+    # defer / cook / vc / audit / remember / worktree / admin / compact / gc / prune / purge
+    "--until", "--mode", "--prefix", "--search-path", "--var", "--strategy",
+    "--kind", "--model", "--prompt", "--response", "--error", "--exit-code", "--tool-name",
+    "--key", "--branch", "--tier", "--batch-size", "--workers", "--summary",
+    "--days", "--older-than", "--pattern", "--group", "--path",
+    # dep list/tree / gate discover / mol / migrate / rules
+    "--direction", "--max-depth", "--max-age", "--for", "--range", "--as", "--ref",
+    "--attach-type", "--include", "--threshold", "--output", "-o",
+    # init / setup / doctor / config / notion / federation / 各種 tracker sync
+    "--add", "--backend", "--database", "--role", "--destroy-token", "--remote",
+    "--agents-file", "--agents-profile", "--agents-template",
+    "--server-host", "--server-port", "--server-socket", "--server-user",
+    "--proxied-server-config-path", "--proxied-server-log-path", "--proxied-server-root-path",
+    "--proxied-server-external-host", "--proxied-server-external-port",
+    "--proxied-server-external-user", "--proxied-server-external-socket-path",
+    "--proxied-server-external-keep-alive",
+    "--proxied-server-external-tls-cert-path", "--proxied-server-external-tls-key-path",
+    "--migration", "--orchestrator-duplicates-threshold", "--source", "--url",
+    "--peer", "--user", "-u", "--password", "--sovereignty",
+    "--issues", "--state", "--states", "--exclude-type", "--types",
+    "--area-path", "--iteration-path",
+}
+
+# 同名 flag が subcommand によって arity を変える箇所(flat 集合では表現不能=どちらに倒しても
+# 一方の subcommand が壊れる)。value 集合から subcmd 単位で差し引いて arity を確定する。
+# ここに列挙しないと bool flag 直後の foreign bead id が値として食われ rule(b) が沈黙する(fail-open)。
+# 実測(flagscan-un-a0t9.local.py)の衝突: --acceptance/--description/--design/--notes/--title は
+# create/update では値取りだが `bd edit` では「どのフィールドを $EDITOR で開くか」の bool、
+# -a/-n/-e は update/create では値取りだが gate 配下(list/discover/check)では bool、
+# -p は update/create では値取りだが `mol show` では bool。
+# ★粒度は top-level subcmd。sub-subcommand 間でも割れる場合(gate list -a=bool / gate discover -a=値)は
+#   安全側(bool=消費しない=fail-closed)へ倒す。過剰 block は FP で済むが取りこぼしは moat 破りのため。
+SUBCMD_BOOL_OVERRIDES = {
+    "edit": {"--acceptance", "--description", "--design", "--notes", "--title"},
+    "gate": {"-a", "-n", "-e"},
+    "mol": {"-p"},
+}
+
+# ★override は top-level subcmd の「リテラル名」で引かれるため、bd 側の subcommand alias を
+#   正規化しないと alias 経路だけ override が外れ bool flag が値取り扱いに戻る=fail-open
+#   (実測: `bd mol show -p un-9` は (b) だが `bd protomolecule show -p un-9` は -p が un-9 を
+#   値として食い (c) へ反転し rule(b) が沈黙した)。SUBCMD_BOOL_OVERRIDES のキーが持つ alias は
+#   ここへ全て登録すること(verified: `bd help mol` → 'Aliases: mol, protomolecule'。
+#   edit/gate に alias 無し)。他 subcmd の alias(close←done 等)は override 非対象ゆえ不要。
+SUBCMD_ALIASES = {
+    "protomolecule": "mol",
+}
+
+# ★操作対象の bead id を **別ファイル/stdin** から取る write flag(= HIGH_DANGER_WRITE と同型)。
+#   これらは SUBCMD_VAL_FLAGS 登録済ゆえ値(パス)は消費され positional が空になり、_foreign_beads の
+#   検査面が空 → funnel(c) で **無検査のまま foreign bead への write が通る**(fail-open)。ファイルの
+#   中身は guard から機械検査不能であり、値がパス形か id 形かで挙動が割れる形状依存も持ち込みたくない。
+#   よって「id を外部ソースから取る write」という modality 単位で rule(d)(msg_d)一律 deny する。
+#   ★delete 決め打ちにしない: 同型の兄弟(dep add --file / migrate issues --ids-file)を取りこぼすと
+#     不変量の適用漏れが構造的に固定される(un-a0t9 self-review finding #1)。
+#   probe 実測(flagscan-un-a0t9.local.py)で「値が id 群のファイル」なのは以下の 3 flag のみ。
+#   他の *-file 系(--reason-file/--body-file/--design-file/comment|note の --file/create --file)は
+#   本文テキストであり id を持たないため対象外(過剰 block を避ける)。batch --file は
+#   HIGH_DANGER_WRITE で既に deny 済。
+#   キーは top-level subcmd 名(bd の alias `migrate issues` ≡ `migrate-issues` は両方登録)。
+#   sub-subcommand 粒度に絞らないのは安全側(read 用法が無いことを probe で確認: dep は add のみ /
+#   migrate は issues のみ / delete は sub-subcommand 無し)。
+EXTERNAL_ID_SOURCE_FLAGS = {
+    "delete": {"--from-file"},
+    "dep": {"--file"},
+    "migrate": {"--ids-file"},
+    "migrate-issues": {"--ids-file"},
 }
 
 
@@ -184,14 +280,36 @@ def _parse_bd(args):
     return sub, operands, (has_C or has_db or has_global), has_readonly
 
 
-def _positional_operands(operands):
-    """operands 全体から positional token を順序保持で抽出(interspersed flag 貫通・移植元と同一)。"""
+def _val_flags(sub):
+    """当該 subcommand における値取り flag 集合(base から subcmd 別 bool override を差し引く)。"""
+    sub = SUBCMD_ALIASES.get(sub, sub)  # alias 経路で override が外れる fail-open を封鎖
+    override = SUBCMD_BOOL_OVERRIDES.get(sub)
+    return SUBCMD_VAL_FLAGS - override if override else SUBCMD_VAL_FLAGS
+
+
+def _external_id_source_flag(sub, operands):
+    """当該 write が「対象 bead id を外部ソース(file/stdin)から取る」flag を含むなら flag 名を返す。
+    glued(--flag=値)形も同一に扱う(形状依存を持ち込まない)。"""
+    flags = EXTERNAL_ID_SOURCE_FLAGS.get(SUBCMD_ALIASES.get(sub, sub))
+    if not flags:
+        return None
+    for o in operands:
+        if o.split("=", 1)[0] in flags:
+            return o.split("=", 1)[0]
+    return None
+
+
+def _positional_operands(operands, sub=None):
+    """operands 全体から positional token を順序保持で抽出(interspersed flag 貫通)。
+    値取り flag(当該 subcmd の arity 基準)は次トークンを値として読み飛ばす=id 形の値を
+    positional と誤認して foreign 判定する FP を防ぐ(un-a0t9)。"""
+    val_flags = _val_flags(sub)
     out = []
     i, n = 0, len(operands)
     while i < n:
         a = operands[i]
         if a.startswith("-"):
-            if a in SUBCMD_VAL_FLAGS and "=" not in a:
+            if a in val_flags and "=" not in a:
                 i += 2
             else:
                 i += 1
@@ -226,7 +344,7 @@ def _foreign_beads(ids, self_pfx):
 
 
 def _check_dep(operands, foreign, self_pfx, is_link=False):
-    pos = _positional_operands(operands)
+    pos = _positional_operands(operands, "link" if is_link else "dep")
     if is_link:
         pos = ["add"] + pos
     action = pos[0] if pos else None
@@ -250,7 +368,7 @@ def _check_dep(operands, foreign, self_pfx, is_link=False):
 
 
 def _check_repo(operands, foreign, self_pfx):
-    pos = _positional_operands(operands)
+    pos = _positional_operands(operands, "repo")
     action = pos[0] if pos else None
     if action is None or action in REPO_READ:
         return None
@@ -273,11 +391,16 @@ def check_bd(core, self_pfx):
         # J2 + ★逸脱(2): foreign→deny(a) / self push|pull→bdw funnel(c) / 他 dolt(commit/status/…)→allow。
         if foreign:
             return ("a", msg_a(self_pfx))
-        pos = _positional_operands(operands)
+        pos = _positional_operands(operands, sub)
         action = pos[0] if pos else None
         if action in DOLT_FUNNEL:
             return ("c", msg_c(self_pfx))  # ★flock 迂回 race 封鎖: self dolt push/pull も bdw funnel
         return None  # dolt commit/status/start/stop 等は同期点/read = allow
+
+    # ★rule(d) 汎化: 対象 id を外部ソース(file/stdin)に持つ write は modality 単位で一律 deny。
+    #   dep/migrate も対象ゆえ各 dispatch より **前** に置く(EXTERNAL_ID_SOURCE_FLAGS 参照)。
+    if _external_id_source_flag(sub, operands) is not None:
+        return ("a", msg_d(self_pfx))
 
     if sub == "dep":
         return _check_dep(operands, foreign, self_pfx)
@@ -287,12 +410,13 @@ def check_bd(core, self_pfx):
         return _check_repo(operands, foreign, self_pfx)
     if sub in HIGH_DANGER_WRITE:
         return ("a", msg_d(self_pfx))  # J6: id 不明高危険 write は一律 deny
+    # (`delete --from-file` を含む外部 id ソース系は上の rule(d) 汎化分岐で処理済)
 
     if foreign:
         return ("a", msg_a(self_pfx))
     if sub in CREATE_LIKE:
         return ("c", msg_c(self_pfx))  # J7: 新規作成は self 自動採番 → (b) 飛ばし (c)
-    pos = _positional_operands(operands)
+    pos = _positional_operands(operands, sub)
     fb = _foreign_beads(pos, self_pfx)
     if fb:
         return ("b", msg_b(self_pfx, " ".join(fb)))
@@ -449,6 +573,60 @@ def run_self_test():
         ("bd dep add un-1 sc-2", B, "b", "dep add: foreign dependent → deny(b)"),
         ("bd link sc-1 un-2", B, "c", "link cross-rig: self dependent + foreign depends-on → c"),
         ("bd link un-1 sc-2", B, "b", "link: foreign dependent → deny(b)"),
+        # ★un-a0t9: 値取り flag の網羅(未登録だと値が positional 扱いになり id 形の値を foreign 誤検出=FP)
+        ("bd update sc-1 --append-notes gate-pending", B, "c", "self+value flag → funnel(c) [un-a0t9 core]"),
+        ("bd update sc-1 --add-label gate-pending", B, "c", "add-label 値消費 → c [worker gate-label path]"),
+        ("bd update sc-1 --set-labels done-review", B, "c", "set-labels 値消費 → c"),
+        ("bd update sc-1 --append-notes=glued-val", B, "c", "glued 形は c 維持"),
+        ("bd update sc-1 --remove-label stale-wip", B, "c", "remove-label 値消費 → c"),
+        ("bd update sc-1 --external-ref gh-9", B, "c", "external-ref 値消費 → c"),
+        ("bd update sc-1 --due next-monday", B, "c", "due 値消費 → c"),
+        ("bd update sc-1 -e 60 --spec-id spec-7", B, "c", "-e(int)/--spec-id 値消費 → c"),
+        ("bd close sc-1 --reason-file close-note", B, "c", "close --reason-file 値消費 → c"),
+        ("bd comment sc-1 --file review-notes", B, "c", "comment --file 値消費 → c"),
+        # ★un-a0t9: delete --from-file は対象 id を別ファイルに持ち機械検査不能 → rule(d) 一律 deny(kind a)
+        ("bd delete --from-file dead-ids", B, "a", "delete --from-file(positional 無し): 無検査一括 delete → deny(d) [destructive fail-open 封鎖]"),
+        ("bd delete --from-file /tmp/ids.txt", B, "a", "パス形でも同様に deny(d) [形状非依存]"),
+        ("bd delete sc-1 --from-file dead-ids", B, "a", "self positional 併用でも --from-file があれば deny(d)"),
+        ("bd delete --from-file=dead-ids", B, "a", "glued 形の --from-file も deny(d)"),
+        ("bd delete sc-1", B, "c", "--from-file 無しの self delete は従来どおり funnel(c) [過剰 block 非導入]"),
+        # ★un-a0t9(self-review #1): rule(d) 汎化 — 同型の兄弟経路も同一 modality として deny(a)
+        ("bd dep add --file deps.jsonl", B, "a", "dep add --file(JSONL 一括辺): 対象 id が別ファイル → deny(d) [兄弟経路]"),
+        ("bd dep add --file -", B, "a", "dep add --file -(stdin)も同様に deny(d)"),
+        ("bd dep add --file=deps.jsonl", B, "a", "glued 形の dep add --file も deny(d)"),
+        ("bd migrate issues --ids-file ids.txt", B, "a", "migrate issues --ids-file: 対象 id が別ファイル → deny(d) [兄弟経路]"),
+        ("bd migrate-issues --ids-file ids.txt", B, "a", "migrate-issues alias でも deny(d)"),
+        ("bd migrate issues --id un-9", B, "b", "inline --id 形は従来どおり foreign 検出(b) [file 形との対称性]"),
+        ("bd dep add sc-1 sc-2", B, "c", "--file 無しの self dep add は従来どおり c [過剰 block 非導入]"),
+        # ★un-a0t9: fail-open 非導入の pin(値 flag 登録が foreign 検出を潰していないこと)
+        ("bd update un-1 --append-notes note-x", B, "b", "foreign target+value flag: foreign 依然検出 → b [fail-open 非導入の証拠]"),
+        ("bd update sc-1 --claim un-9", B, "b", "bool --claim 直後の foreign positional → 依然(b) [moat pin]"),
+        ("bd update sc-1 --stdin un-9", B, "b", "bool --stdin 直後の foreign → 依然(b) [moat pin]"),
+        ("bd close -f un-9", B, "b", "-f は close で bool(--force) → 直後 foreign 依然(b) [arity 衝突 pin]"),
+        # ★un-a0t9: subcmd 別 arity(同名 flag が subcmd で値/bool を変える箇所の moat pin)
+        ("bd edit --title un-9", B, "b", "edit の --title は bool → 直後 foreign 依然(b) [arity override pin]"),
+        ("bd edit --notes un-9", B, "b", "edit の --notes は bool → 依然(b) [arity override pin]"),
+        ("bd gate list -a un-9", B, "b", "gate list の -a は bool → 依然(b) [arity override pin]"),
+        ("bd gate discover -n un-9", B, "b", "gate discover の -n は bool → 依然(b) [arity override pin]"),
+        ("bd gate check -e un-9", B, "b", "gate check の -e は bool → 依然(b) [arity override pin]"),
+        ("bd mol show -p un-9", B, "b", "mol show の -p は bool → 依然(b) [arity override pin]"),
+        ("bd protomolecule show -p un-9", B, "b", "mol alias でも -p は bool → 依然(b) [alias moat pin]"),
+        ("bd update sc-1 --notes x --title y", B, "c", "update では --notes/--title は値取り(override は edit 限定)"),
+        # ★un-a0t9: 兄弟 write subcommand の網羅(update だけでなく defer/cook/vc/audit/remember/worktree/admin)
+        ("bd defer sc-1 --until next-monday", B, "c", "defer --until 値消費 → c(update --due と同型 FP の封鎖)"),
+        ("bd cook --mode dry-run", B, "c", "cook --mode 値消費 → c"),
+        ("bd vc merge --strategy fast-forward", B, "c", "vc merge --strategy 値消費 → c"),
+        ("bd audit record --kind tool-use", B, "c", "audit record --kind 値消費 → c"),
+        ("bd remember --key project-notes", B, "c", "remember --key 値消費 → c"),
+        ("bd worktree create sc-1 --branch feat-x", B, "c", "worktree create --branch 値消費 → c"),
+        ("bd admin compact --tier hot-tier", B, "c", "admin compact --tier 値消費 → c"),
+        # ★un-a0t9: 値が bead id 自体になる flag は非登録=fail-closed(foreign 検査面から消さない)
+        # この 3 件が (b) を保つことが moat の非空虚な pin。mutant M-idval が RED 化を保証する。
+        ("bd duplicate sc-1 --of un-9", B, "b", "--of の値 un-9 は foreign 検出対象のまま → b [id 値 flag 非登録=fail-closed pin]"),
+        ("bd update sc-1 --event-target un-9", B, "b", "--event-target 非登録 → foreign 依然検出 b [id 値 flag 非登録=fail-closed pin]"),
+        ("bd gate create sc-1 --waits-for un-9", B, "b", "--waits-for 非登録 → foreign 依然検出 b [id 値 flag 非登録=fail-closed pin]"),
+        ("bd gate create sc-1 --blocks un-9", B, "b", "--blocks(id 値)非登録 → foreign 依然検出 b [id 値 flag 非登録=fail-closed pin]"),
+        ("bd admin compact --id un-9", B, "b", "--id(id 値)非登録 → foreign 依然検出 b [id 値 flag 非登録=fail-closed pin]"),
         # launcher / inline / FP
         ("sudo bd update un-1", B, "b", "launcher: sudo"),
         ('bash -c "bd update un-1"', B, "b", "launcher: bash -c"),
