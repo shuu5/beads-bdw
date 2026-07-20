@@ -317,6 +317,175 @@ WRAPEOF
   grep -q '^dolt pull$' "$CALLS"            # load-bearing: no-op 枝でなく実 pull を実行した
 }
 
+# ═══ un-xywb: resolve_export_root の subdir 台帳誤解決 fix(auto-export root) ═══════════
+# bug(ccs-cu9 一次): 独自 .git を持たない subdir 台帳(親 repo の subdir に自前 .beads/embeddeddolt)で
+#   旧 resolve_export_root=dirname(git-common-dir) が親 repo root へ誤解決し、auto-export が親の live
+#   mirror(例 scribe/.beads/issues.jsonl)を silent 上書きする。fix(walk-up): $PWD..git toplevel で最初に
+#   見つかる「物理 DB(embeddeddolt/ / dolt/ / proxieddb/)を持つ .beads」の dir へ収束させる。
+
+# ─── ① 一次検証(dolt 非依存・stub bd): subdir 台帳の auto-export は subdir mirror へ(親でない) ───
+# topology(fence i): 親 temp を git init。subdir に .beads/embeddeddolt を作るが subdir では git init
+#   しない(subdir に git init するとバグ非発火=vacuous)。親も台帳にして『親 mirror silent 上書き』を再現可能に。
+# stub bd(BDW_BD_BIN)が `export -o <path>` を含む argv を CALLS に記録する dolt 非依存方式で、
+#   auto-export の効き先を直接 assert する(sandbox で real dolt 不能でも非空虚)。正側 grep で
+#   「export が実際に走り subdir を指した」ことを担保(silent skip を負側 assert の根拠にしない)。
+@test "export-root-subdir-ledger: subdir 台帳(独自 .git 無し)の auto-export は subdir mirror へ(親でない)" {
+  PARENT="$BATS_TEST_TMPDIR/xywb-parent"; SUB="$PARENT/sub"
+  mkdir -p "$PARENT" && ( cd "$PARENT" && git init -q && git config user.email t@e.com && git config user.name t )
+  mkdir -p "$PARENT/.beads/embeddeddolt" "$SUB/.beads/embeddeddolt"   # 親/subdir 両方が物理 DB 持ち台帳
+  # subdir は独自 .git を持たない(親 toplevel)ことを pin(=バグ発火条件・vacuous 化防止)
+  run bash -c 'cd "'"$SUB"'" && git rev-parse --show-toplevel'
+  [ "$status" -eq 0 ]; [ "$output" != "$SUB" ]
+  [ ! -e "$SUB/.git" ]
+  expstub="$BATS_TEST_TMPDIR/bd-exp-stub"
+  cat > "$expstub" <<STUBEOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$CALLS"
+case "\$*" in
+  "dolt remote list") echo "No remotes configured."; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUBEOF
+  chmod +x "$expstub"
+  : >"$CALLS"
+  run env BDW_BD_BIN="$expstub" CALLS="$CALLS" BDW_LOCK_DIR="$BDW_LOCK_DIR" \
+      bash -c 'cd "'"$SUB"'" && "'"$BDW"'" update sub-1 --append-notes probe'
+  [ "$status" -eq 0 ]
+  grep -qF "export -o $SUB/.beads/issues.jsonl" "$CALLS"        # 正側(非空虚): subdir mirror へ効いた
+  ! grep -qF "export -o $PARENT/.beads/issues.jsonl" "$CALLS"   # 負側(bug 検出): 親 mirror を上書きしない
+}
+
+# ─── ①' 多段上昇 control(dolt 非依存): cwd が台帳 root より深い subdir でも walk-up が上昇して収束 ───
+# 看板機構「$PWD..git toplevel の bounded walk-up」の【上昇段(dir="$parent")】そのものの非空虚性を保証する。
+# 既存 ① は cwd==台帳 root($SUB)で即 return するため中間 dir を跨ぐ上昇経路を一度も通らない(=上昇段が無検証)。
+# realistic modality: worker の cwd が台帳 root より深い subdir(例 scribe/src/foo から bdw を叩き scribe へ収束)。
+# topology: 親 = git init(toplevel・親も物理 DB 持ち台帳=誤収束先) / $SUB = 物理 DB 持ち subdir 台帳(真の収束先) /
+#   $DEEP = $SUB/deep(.beads 無し=cwd)。walk-up は $DEEP → $SUB へ 1 段上昇して $SUB/.beads/embeddeddolt を発見する。
+#   ★上昇段を潰す退行(例 dir="$parent" を dir="$toplevel" に変異=中間 $SUB を skip)ではここで $PARENT へ escape し
+#     FAIL する(M14 で機械保証)。既存 ① は $SUB で即 return するため上昇段を skip しても FAIL しない(vacuous だった)。
+@test "export-root-subdir-deep: 台帳 root より深い cwd から walk-up が上昇して subdir 台帳 mirror へ収束(親でない)" {
+  PARENT="$BATS_TEST_TMPDIR/xywb-deep"; SUB="$PARENT/sub"; DEEP="$SUB/deep"
+  mkdir -p "$DEEP" && ( cd "$PARENT" && git init -q && git config user.email t@e.com && git config user.name t )
+  mkdir -p "$PARENT/.beads/embeddeddolt" "$SUB/.beads/embeddeddolt"   # 親/subdir 両方が物理 DB 持ち台帳
+  [ ! -e "$DEEP/.beads" ]                     # cwd は台帳 root より深く .beads を持たない(=上昇が必要な条件)
+  # subdir は独自 .git を持たない(親 toplevel)ことを pin(=バグ発火条件・vacuous 化防止)
+  run bash -c 'cd "'"$DEEP"'" && git rev-parse --show-toplevel'
+  [ "$status" -eq 0 ]; [ "$output" = "$PARENT" ]   # toplevel=$PARENT(≠$SUB≠$DEEP)。上昇は $DEEP→$SUB の 1 段
+  [ ! -e "$SUB/.git" ]
+  expstub="$BATS_TEST_TMPDIR/bd-deep-stub"
+  cat > "$expstub" <<STUBEOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$CALLS"
+case "\$*" in
+  "dolt remote list") echo "No remotes configured."; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUBEOF
+  chmod +x "$expstub"
+  : >"$CALLS"
+  run env BDW_BD_BIN="$expstub" CALLS="$CALLS" BDW_LOCK_DIR="$BDW_LOCK_DIR" \
+      bash -c 'cd "'"$DEEP"'" && "'"$BDW"'" update deep-1 --append-notes probe'
+  [ "$status" -eq 0 ]
+  grep -qF "export -o $SUB/.beads/issues.jsonl" "$CALLS"        # 正側(非空虚): 上昇して subdir 台帳 root へ収束した
+  ! grep -qF "export -o $PARENT/.beads/issues.jsonl" "$CALLS"   # 負側(上昇段退行の検出): 親へ over-ascend しない
+}
+
+# ─── ② worktree 非回帰 control(dolt 非依存): worktree からの auto-export は anchor へ収束 ────────
+# fence(iii). anchor に .beads/embeddeddolt(物理 DB=per-machine) + tracked な .beads/metadata.json を
+#   commit。git worktree add で worktree の .beads には metadata.json のみ materialize され embeddeddolt は
+#   来ない(物理 DB dir は gitignore 対象=checkout に現れない)。walk-up は空振りし fallback=anchor へ収束する。
+#   ★metadata.json を marker にする実装ならここで worktree を誤選択し FAIL する(marker 選定の load-bearing 制御)。
+@test "export-root-worktree-noregress: worktree からの auto-export は anchor mirror へ収束(worktree でない)" {
+  ANCHOR="$BATS_TEST_TMPDIR/xywb-anchor"
+  mkdir -p "$ANCHOR/.beads" && ( cd "$ANCHOR" && git init -q && git config user.email t@e.com && git config user.name t \
+      && printf '{}\n' > .beads/metadata.json && git add .beads/metadata.json && git commit -qm beads )
+  mkdir -p "$ANCHOR/.beads/embeddeddolt"     # 物理 DB(commit しない=gitignore 相当・per-machine)
+  WT="$ANCHOR/wt"
+  ( cd "$ANCHOR" && git worktree add -q "$WT" -b xywb-wtbranch >/dev/null 2>&1 )
+  [ -f "$WT/.beads/metadata.json" ]          # tracked は materialize される
+  [ ! -d "$WT/.beads/embeddeddolt" ]         # 物理 DB dir は materialize されない
+  expstub="$BATS_TEST_TMPDIR/bd-wt-stub"
+  cat > "$expstub" <<STUBEOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$CALLS"
+case "\$*" in
+  "dolt remote list") echo "No remotes configured."; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUBEOF
+  chmod +x "$expstub"
+  : >"$CALLS"
+  run env BDW_BD_BIN="$expstub" CALLS="$CALLS" BDW_LOCK_DIR="$BDW_LOCK_DIR" \
+      bash -c 'cd "'"$WT"'" && "'"$BDW"'" update a-1 --append-notes probe'
+  [ "$status" -eq 0 ]
+  grep -qF "export -o $ANCHOR/.beads/issues.jsonl" "$CALLS"     # anchor へ収束
+  ! grep -qF "export -o $WT/.beads/issues.jsonl" "$CALLS"       # worktree へは書かない
+}
+
+# ─── ②' 越境ガード control(dolt 非依存): walk-up は git toplevel を越えない(escape 防止) ──────────
+# fence/コメント(:140-142)が load-bearing とする破壊防止不変量『walk-up は git toplevel を越えない=
+#   git 管理外 / $HOME/.beads への escape を構造的に禁止』の非空虚性を、越境退行を検出する形で機械保証する。
+# topology: OUTER(git 管理外・toplevel の親)に物理 DB 持ち .beads を置き、TOP=OUTER/repo を git init して
+#   toplevel にする。TOP/.beads は存在するが物理 DB を持たない(=fallback anchor)。cwd=TOP。
+#   ・境界が効く実装: dir=TOP は物理 DB 無し→toplevel break→fallback=dirname(common-dir)=TOP へ export。
+#   ・境界を外した退行: walk-up が TOP を越えて OUTER/.beads/embeddeddolt を発見し OUTER へ escape する。
+#   実バグ相当は「toplevel まで物理 DB 無し + 親側($HOME/.beads 等)に物理 DB 実在」で auto-export が
+#   global mirror を silent 上書きする破壊。ここではその親を OUTER として再現し、越境しないことを assert。
+#   ★このトポロジは既存 2 case では守られない: subdir-ledger は SUB で即 return し break を通らず、
+#     worktree-noregress は break 除去でも WT→ANCHOR で同じ ANCHOR を返し PASS のままだった(M13 で機械保証)。
+@test "export-root-boundary-escape: toplevel 越え先(親)に物理 DB があっても越境せず fallback anchor へ収束" {
+  BASE="$BATS_TEST_TMPDIR/xywb-boundary"; OUTER="$BASE/outer"; TOP="$OUTER/repo"
+  mkdir -p "$TOP/.beads" "$OUTER/.beads/embeddeddolt"      # TOP/.beads=物理 DB 無し / OUTER=物理 DB 持ち(越境先)
+  ( cd "$TOP" && git init -q && git config user.email t@e.com && git config user.name t )
+  [ ! -d "$TOP/.beads/embeddeddolt" ]        # toplevel は物理 DB を持たない(=boundary break を実際に通る)
+  [ -d "$OUTER/.beads/embeddeddolt" ]        # 越境先(親)は物理 DB を持つ(=越境退行時の誤収束先)
+  run bash -c 'cd "'"$TOP"'" && git rev-parse --show-toplevel'
+  [ "$status" -eq 0 ]; [ "$output" = "$TOP" ]   # boundary=TOP。OUTER は toplevel の外側(git 管理外の親)
+  expstub="$BATS_TEST_TMPDIR/bd-boundary-stub"
+  cat > "$expstub" <<STUBEOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$CALLS"
+case "\$*" in
+  "dolt remote list") echo "No remotes configured."; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUBEOF
+  chmod +x "$expstub"
+  : >"$CALLS"
+  run env BDW_BD_BIN="$expstub" CALLS="$CALLS" BDW_LOCK_DIR="$BDW_LOCK_DIR" \
+      bash -c 'cd "'"$TOP"'" && "'"$BDW"'" update b-1 --append-notes probe'
+  [ "$status" -eq 0 ]
+  grep -qF "export -o $TOP/.beads/issues.jsonl" "$CALLS"       # 正側(非空虚): 境界で停止し fallback anchor(=toplevel)へ
+  ! grep -qF "export -o $OUTER/.beads/issues.jsonl" "$CALLS"   # 負側(越境検出): toplevel を越え親の物理 DB へ escape しない
+}
+
+# ─── ③ real bd 正側 e2e: 実 bd の subdir 台帳で auto-export が subdir mirror を生成し対象 issue を含む ──
+# fence「real bd が temp で動くなら正側 e2e を追加」。実バグトポロジ(ccs-cu9/scribe/cc-session と同型)を
+#   real bd で構築: 親 = commit 有 git repo(台帳でない) / sub = bd init で自前 .beads/embeddeddolt(親が
+#   台帳でないため bd は sub に local 台帳を作り、独自 .git は作らず親 git を使う=subdir 台帳)。
+@test "export-root-subdir-real: 実 bd の subdir 台帳で auto-export が subdir mirror を生成し対象 issue を含む" {
+  _need_real_tools || return 1
+  RP="$BATS_TEST_TMPDIR/xywb-real"; PARENT="$RP/parent"; SUB="$PARENT/sub"; mkdir -p "$SUB"
+  ( cd "$PARENT" && git init -q && git config user.email t@e.com && git config user.name t \
+      && printf x > f && git add f && git commit -qm init )
+  ( cd "$SUB" && bd init >/dev/null 2>&1 )
+  [ -d "$SUB/.beads/embeddeddolt" ]          # sub は物理 DB 持ち台帳
+  [ ! -e "$SUB/.git" ]                       # 独自 .git を持たない(=subdir 台帳・親 toplevel)
+  run bash -c 'cd "'"$SUB"'" && git rev-parse --show-toplevel'
+  [ "$output" != "$SUB" ]
+  tid="$( cd "$SUB" && bd create --title realtgt --json 2>/dev/null | jq -r '.id' )"
+  [ -n "$tid" ] && [ "$tid" != null ]
+  # bdw 自身の auto-export が走ったことを非空虚に示すため、事前に mirror を消してから WRITE する
+  rm -f "$SUB/.beads/issues.jsonl"
+  run env -u BDW_BD_BIN BDW_LOCK_DIR="$BATS_TEST_TMPDIR/xywb-reallocks" BDW_SYNC_THROTTLE_SECS=0 \
+      bash -c 'cd "'"$SUB"'" && "'"$BDW"'" update "'"$tid"'" --append-notes REAL_AE'
+  ( cd "$SUB" && bd dolt stop >/dev/null 2>&1 ) || true
+  [ "$status" -eq 0 ]
+  [ -s "$SUB/.beads/issues.jsonl" ]          # 正側: subdir mirror が生成された
+  grep -q "$tid" "$SUB/.beads/issues.jsonl"  # 正側: 対象 issue を含む
+  [ ! -e "$PARENT/.beads/issues.jsonl" ]     # 負側: 親(非台帳)には mirror を作らない
+}
+
 @test "e2e-conflict: 実 bd の genuine merge conflict は exit 3(block)" {
   _need_real_tools || return 1
   RP="$BATS_TEST_TMPDIR/rconf"; BARE="$RP/bare"; A="$RP/a"; B="$RP/b"; mkdir -p "$BARE" "$A" "$B/.beads"

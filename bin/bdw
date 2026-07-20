@@ -120,19 +120,53 @@ resolve_lock_file() {
   printf '%s/bd-write-%s.lock' "$ld" "$rid"
 }
 
-# --- export root 解決(inline・auto-export の mirror 先を単一物理 mirror に収束させる) ------
-# export 先 root = git common-dir の親 dir。anchor + 全 worktree は git common-dir 経由で「物理
-# 1 つの DB」を共有し、worktree の .beads は tracked ファイルのみ(embeddeddolt/issues.jsonl は
-# anchor 一元)ゆえ、mirror(issues.jsonl)も anchor root の 1 つに収束させる(repo_id 解決と同じ
-# 「物理 DB と 1 対 1」哲学)。common-dir は物理パスへ正規化(symlink 経由の別名でも同一に収束)。
-# git 外(common-dir 得られず)は return 1 → 上流で silent skip(export しない・write は成功のまま)。
+# --- export root 解決(inline・auto-export の mirror 先を「物理 DB を持つ .beads」に収束させる) ---
+# export 先 root = 「物理 DB(embeddeddolt/ or dolt/ or proxieddb/)を持つ .beads を格納する dir」。
+# 3 topology を単一の bounded walk-up で正しく解く(un-xywb / 一次 SSOT=ccs-cu9):
+#   ① 通常 anchor   : $PWD..git toplevel で最初に見つかる物理 DB 持ち .beads = anchor
+#                     (dirname(common-dir)と同値。旧挙動を維持)。
+#   ② git worktree  : worktree の .beads は tracked ファイルのみで物理 DB dir(embeddeddolt/ 等)は
+#                     .beads/.gitignore 対象ゆえ checkout に materialize されない → walk-up は空振りし
+#                     fallback=dirname(common-dir)=anchor へ収束(worktree→anchor 単一 mirror 不変量を
+#                     維持・bdw-selftest.sh AUTOEXPORT(v)の負側 assert を満たす)。
+#   ③ subdir 台帳   : 独自 .git を持たず親 repo の subdir に自前 .beads/embeddeddolt を持つ台帳
+#                     (実例 scribe/cc-session)。旧 dirname(common-dir)=親 root 誤解決を根治し、その
+#                     subdir 自身へ収束させる(ccs-cu9 の『親 mirror silent 上書き』を止める)。
+# ★物理 DB マーカーは embeddeddolt/ / dolt/ / proxieddb/ のみ(いずれも .beads/.gitignore 対象=
+#   worktree checkout に現れない)。metadata.json/config.yaml は git tracked ゆえ worktree の .beads
+#   にも materialize され、これを marker にすると ② で worktree を台帳 root と誤認し worktree→anchor
+#   収束を破る(実測・un-xywb)——ゆえ fence の「embeddeddolt/ or metadata.json」から metadata.json を
+#   除外した(code 根拠)。resolve_repo_id(:101)は不変(subdir→親 rid 収束は over-lock=benign・ccs-cu9)。
+# 越境ガード: walk-up は git toplevel(show-toplevel)を越えない(git 管理外 / $HOME/.beads への escape を
+#   構造的に禁止)。toplevel 不明時は walk-up せず fallback(旧挙動)=fail-safe。common-dir は物理パスへ
+#   正規化(symlink 別名でも同一収束)。git 外(common-dir 得られず)は return 1 → 上流で silent skip。
+_bdw_beads_has_physical_db() {
+  # $1=候補 dir。その .beads が物理 DB(embeddeddolt/ / dolt/ / proxieddb/)を持てば 0。
+  [ -d "$1/.beads/embeddeddolt" ] || [ -d "$1/.beads/dolt" ] || [ -d "$1/.beads/proxieddb" ]
+}
 resolve_export_root() {
-  local common_dir
+  local common_dir git_root toplevel dir parent
   common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
   [ -z "$common_dir" ] && common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
   [ -z "$common_dir" ] && return 1
   common_dir="$(cd "$common_dir" 2>/dev/null && pwd -P || printf '%s' "$common_dir")"
-  printf '%s' "$(dirname "$common_dir")"
+  git_root="$(dirname "$common_dir")"     # 旧挙動 = fallback(anchor/worktree はこれで正)
+  # toplevel = walk-up の越境上限。得られなければ walk-up せず旧挙動へ(fail-safe)。
+  toplevel="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -n "$toplevel" ]; then
+    toplevel="$(cd "$toplevel" 2>/dev/null && pwd -P || printf '%s' "$toplevel")"
+    dir="$(pwd -P 2>/dev/null || printf '%s' "$PWD")"
+    while :; do
+      if _bdw_beads_has_physical_db "$dir"; then
+        printf '%s' "$dir"; return 0     # 物理 DB 持ち .beads = 真の台帳 root(subdir 台帳を含む)
+      fi
+      [ "$dir" = "$toplevel" ] && break  # git toplevel で停止(越境しない)
+      parent="$(dirname "$dir")"
+      [ "$parent" = "$dir" ] && break    # / に到達(無限ループ保険)
+      dir="$parent"
+    done
+  fi
+  printf '%s' "$git_root"                 # walk-up 空振り or toplevel 不明 → 旧挙動
 }
 
 # --- auto-export: WRITE 成功後に .beads/issues.jsonl mirror を再生成(orch-89v 恒久 fix) -----
