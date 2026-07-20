@@ -21,6 +21,45 @@ timer が周期的に鮮度を回収する **fail-safe backstop**。
   remote 未設定の台帳は timer が起動しても **graceful no-op**(何もしない)。
 - `systemctl --user` が使える(user systemd instance が動いている)。常時起動サーバーでセッション
   外でも動かすには linger を有効化: `sudo loginctl enable-linger "$USER"`。
+- `bd` 実体が **systemd user service から見える PATH 上**にあること。user service の PATH は
+  ログインシェルのものを継承せず `~/.local/bin` を含まないホストがある(ipatho-server-2 実例)。
+  この場合 timer は起動しても `bd` を解決できず **no-op** に落ちる。これは上記の
+  **remote 未設定 no-op(恒久・正常挙動)とは別物**で、環境設定の不足による不具合ゆえ解消する。
+  判別は journal に次が出るか: `bd executable not found (BDW_BD_BIN=…) — no-op`。
+  出たら **timer 側ではなく service 側**の drop-in で `BDW_BD_BIN` に `bd` の絶対パスを差す
+  (service の `ExecStart` が読む環境は service unit のものだけで、timer unit に置いた
+  `Environment=` は伝播せず no-op のまま silent に縮退する = false-green)。
+
+```sh
+# 1) パスは対話シェルで確認(systemd user PATH に無いのが本症状そのもの)
+command -v bd            # 例: /home/me/.local/bin/bd
+
+# 2) service 側 drop-in(template 全 instance に効く)
+mkdir -p ~/.config/systemd/user/bdw-sync@.service.d
+cat > ~/.config/systemd/user/bdw-sync@.service.d/override.conf <<'EOF'
+[Service]
+Environment=BDW_BD_BIN=%h/.local/bin/bd
+EOF
+
+# 3) 反映確認(template unit は instance 名なしでは load できないので必ず instance を指定する。
+#    `systemctl --user show 'bdw-sync@.service' …` は
+#    "Unit name bdw-sync@.service is missing the instance name." で失敗する = false-red)
+LEDGER=/home/me/ledger
+INST="bdw-sync@$(systemd-escape "$LEDGER")"
+systemctl --user daemon-reload
+systemctl --user show "$INST.service" -p Environment   # BDW_BD_BIN=/home/me/.local/bin/bd と展開されて出れば OK
+
+# 3') 補助: drop-in が取り込まれた素のテキストを見る(こちらは template のままでも動く。
+#     ただし specifier は未解決のまま表示される = %h は $HOME に展開されずそのまま出る)
+systemctl --user cat 'bdw-sync@.service'
+
+# 4) 実動作確認(oneshot ゆえ timer の restart では検証できない。service を直接 1 回起動する)
+systemctl --user start "$INST.service"
+journalctl --user -u "$INST.service" -n 10 --no-pager      # no-op 警告が消え pull/push が動いていれば OK
+```
+
+  `%h` は systemd が `$HOME` に展開する(ホスト固有の絶対パスを直書きしないので fleet 間で移植可能)。
+  この drop-in で quiet success + sync marker 更新まで通ることは 2026-07-16 に本機で確認済み。
 
 ## インストール(台帳 1 つあたり)
 
