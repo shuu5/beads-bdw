@@ -90,9 +90,15 @@ sc-nd6/OG-1)一方、`bd export -o` は `.beads` 直下に temp を作り rename
 (下記「発火条件」)。sandboxed worker の mirror 再生成は **admin/orchestrator の sandbox 外 gate-time
 export に依存**する(この canonical fix は sandbox 内までは届かない)。
 
-- **export 先 root** = git common-dir の親 dir(**anchor root**)。anchor + 全 worktree は物理 1 DB を
-  共有し worktree の `.beads` は tracked ファイルのみゆえ、mirror も anchor の 1 つに収束させる
-  (`repo_id` 解決と同じ「物理 DB と 1 対 1」哲学)。
+- **export 先 root** = `$PWD` から git toplevel(`show-toplevel`)までの **bounded walk-up** で最初に見つかる
+  「物理 DB(`embeddeddolt/` / `dolt/` / `proxieddb/`)を持つ `.beads`」の dir。空振り(見つからない)/ toplevel 不明時は
+  `dirname(git-common-dir)`(**anchor root**)へ fallback(旧挙動)。3 topology を単一機構で解く: 通常 anchor は
+  toplevel の `.beads` で即収束し従来と同値、git worktree は物理 DB dir が checkout に無い(gitignore 対象)ため
+  空振りして fallback で anchor へ収束、独自 `.git` を持たない **subdir 台帳**(親 repo の subdir に自前
+  `.beads/embeddeddolt` を持つ・実例 `scribe/cc-session`)はその subdir 自身へ収束する(旧 `dirname(common-dir)`=
+  親 root 誤解決で親 live mirror を silent 上書きしていた退行の根治・ccs-cu9/un-xywb)。marker は物理 DB dir のみ
+  (`metadata.json` 等の tracked ファイルは worktree checkout に materialize されるため marker にしない)。
+  **越境ガード**: walk-up は git toplevel を越えない(`$HOME/.beads` 等 git 管理外への escape を構造的に禁止)。
 - **発火条件**: `rc==0` かつ `BDW_NO_AUTOEXPORT != 1` かつ subcmd が `export` でない(二重 export 回避)
   かつ export 先 `.beads` dir が実在 **かつ書込可能**。git 外 / `.beads` 不在 / `.beads` dir が
   read-only(sandbox の bwrap bind・RO mount)は **silent skip**(write は成功のまま・warn も出さない)。

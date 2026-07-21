@@ -20,6 +20,14 @@
 #   ⑦ 複合 scheme(L1)  : M9a scheme 照合を旧 [a-z]+:// へ revert   : scheme-git-https-pull
 #   ⑦ 複合 scheme(L3)  : M9b 同上(push 経路を独立に保証)          : scheme-git-https-push
 #   ⑦ over-match 制御  : M10 scheme 照合を何でも通るに緩める      : scheme-no-url
+#   subdir 台帳 fix    : M11 resolve_export_root walk-up を no-op  : export-root-subdir-ledger
+#   (un-xywb)            (物理 DB 検出を常に不成立=旧 dirname(common-dir)へ revert)
+#   worktree 非回帰    : M12 marker を「.beads あれば match」に緩め : export-root-worktree-noregress
+#   marker 選定        (物理 DB gate 撤廃=metadata.json checkout で worktree 誤選択)
+#   越境ガード escape  : M13 toplevel break を no-op(境界を無効化)   : export-root-boundary-escape
+#   (un-xywb)            (walk-up が toplevel を越え親の物理 DB へ誤収束=escape)
+#   多段上昇の非空虚   : M14 上昇段 dir="$parent" を dir="$toplevel" へ : export-root-subdir-deep
+#   (un-xywb)            (中間 dir を skip=看板の walk-up 上昇段そのものを潰し親へ escape)
 
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
@@ -134,6 +142,40 @@ run_mutant M9b-scheme-revert-push bdw-sync "$SCHEME_REVERT" \
 run_mutant M10-scheme-overmatch bdw-sync \
   "s#grep -qE '\^[^']*'#grep -qE '.'#" \
   "scheme-no-url" "⑦scheme-overmatch"
+
+# M11: resolve_export_root の walk-up を no-op 化(物理 DB 検出を常に不成立=return 1)→ 空振り fallback で
+#   旧 dirname(common-dir)へ revert。subdir 台帳では親 root へ誤解決し auto-export が親 mirror を指す
+#   =「修正前 FAIL / 修正後 PASS」の対称実証(un-xywb 新 case の非空虚性の機械保証)。
+run_mutant M11-export-root-revert bdw \
+  's/^_bdw_beads_has_physical_db() {/_bdw_beads_has_physical_db() { return 1; :/' \
+  "export-root-subdir-ledger" "subdir-export-root(un-xywb)"
+
+# M12: 物理 DB gate を撤廃し「.beads があれば台帳 root」に緩める(over-match) → worktree checkout に来る
+#   tracked ファイル(metadata.json 等)だけの .beads を worktree で誤選択し、worktree→anchor 収束を破る。
+#   marker を物理 DB dir 限定にした load-bearing 判断(metadata.json 除外)の非空虚性を worktree 側で機械保証。
+run_mutant M12-export-root-any-beads bdw \
+  's/^_bdw_beads_has_physical_db() {/_bdw_beads_has_physical_db() { [ -d "$1\/.beads" ]; return; :/' \
+  "export-root-worktree-noregress" "worktree-noregress(un-xywb)"
+
+# M13: walk-up の toplevel 境界 break を no-op 化(境界を無効化)→ walk-up が git toplevel を越えて親側の
+#   物理 DB(OUTER/.beads/embeddeddolt)を発見し escape する。escape 防止の安全境界(git 管理外/$HOME/.beads
+#   への越境禁止=fence :140-142 の load-bearing 不変量)の非空虚性を、越境退行を検出する形で機械保証する。
+#   ★M11/M12 は fix 本体(walk-up 発火・marker 選定)を守るが安全境界は守らない: 既存 2 case は境界を外しても
+#     FAIL しない(subdir は SUB で即 return し break 未通過 / worktree は WT→ANCHOR で同じ ANCHOR を返す)。
+run_mutant M13-export-root-no-boundary bdw \
+  's/\[ "$dir" = "$toplevel" \] && break/:/' \
+  "export-root-boundary-escape" "boundary-escape(un-xywb)"
+
+# M14: walk-up の上昇段 dir="$parent"(1 段ずつ上る)を dir="$toplevel"(全中間 dir を一気に skip)へ変異 → cwd が
+#   台帳 root より深い subdir にあるとき、中間の真の台帳 root($SUB)を跨いで toplevel($PARENT)へ escape する。
+#   看板機構「$PWD..git toplevel の bounded walk-up」の【上昇段そのもの】の非空虚性を機械保証する(この上昇を
+#   通る realistic modality=深い cwd を既存 ①/②/②'/③ が一つも張っていなかった=上昇段が無検証だった穴を塞ぐ)。
+#   ★M11–M13 はこの mutant を代替しない: いずれも cwd==台帳 root か cwd==toplevel で即 return/即 break のため
+#     上昇段を一度も通らず、dir="$toplevel" 変異でも同じ export root を返して PASS のままだった(export-root-subdir-deep
+#     でのみ FAIL する)。
+run_mutant M14-export-root-skip-ascent bdw \
+  's/dir="$parent"/dir="$toplevel"/' \
+  "export-root-subdir-deep" "subdir-deep-ascent(un-xywb)"
 
 echo "----" | tee -a "$LOG"
 if [ "$fails" -eq 0 ]; then
