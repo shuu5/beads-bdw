@@ -105,6 +105,13 @@ DEP_READ = {"list", "tree", "cycles"}
 REPO_READ = {"list"}
 HIGH_DANGER_WRITE = {"sql", "batch", "import"}
 CREATE_LIKE = {"create", "q", "create-form"}
+# mol の create-like sub-subcommand(un-aukl): pour/wisp は proto(mol-*)から self 台帳へ新規 bead を
+# spawn する create 同型操作。positional proto-id(mol-feat 等)は BD_ID_RE に一致するが write 対象の
+# foreign bead ではないため、CREATE_LIKE の J7 と同じく rule(b) 検査を飛ばし funnel(c) へ落とす。
+# ★免除は {pour, wisp} 厳密限定: burn/squash/bond/dissolve/distill は**既存 mol への write** で
+#   positional が本物の foreign 対象になりうる。ここへ拡張すると rule(b) が沈黙し b→c 反転=fail-open
+#   (owner-2 moat 破り)。拡張禁止は mutant M-molmoat が RED で守る(免除除去側は M-molfp)。
+MOL_CREATE_LIKE = {"pour", "wisp"}
 # self dolt funnel 対象(逸脱(2)): push/pull は flock 迂回 race を封鎖するため bdw funnel(c)。
 DOLT_FUNNEL = {"push", "pull"}
 
@@ -120,6 +127,9 @@ DOLT_FUNNEL = {"push", "pull"}
 #   非登録の id 値 flag(probe 実測・write 面): --of(duplicate) / --blocks,-b(dep, gate create) /
 #   --id(admin compact, migrate issues) / --ids-file(migrate issues) / --issue-id(audit record) /
 #   --attach(mol pour) / --deps / --waits-for / --event-target。
+#   ★--attach(mol pour)追補(un-aukl): mol pour/wisp は MOL_CREATE_LIKE の create-like 免除で
+#     rule(b) 検査自体を飛ばすため --attach 隣接 FP は解決済=SUBCMD_VAL_FLAGS への登録は不要のまま。
+#     登録しても positional proto FP は残り(false-green)、id 値を消費する trap だけが増える(登録禁止)。
 #   ★この非登録は self-test の [id 値 flag 非登録=fail-closed pin] 群と mutant M-idval が守る。
 #   網羅を仕上げる後続作業者へ: probe 出力を機械的に流し込むとこの集合が混入し、全 green のまま
 #   moat が破れる。追加時は必ず上記除外集合を差し引くこと。
@@ -241,8 +251,10 @@ def msg_d(self_pfx):
 
 
 def _parse_bd(args):
-    """bd のグローバルフラグを消費し (sub, operands, foreign, has_readonly) を返す(移植元と同一)。"""
-    has_C = has_db = has_global = has_readonly = False
+    """bd のグローバルフラグを消費し (sub, operands, foreign, has_readonly, has_help) を返す。
+    移植元と同一の骨格に un-aukl item(3) の -h/--help 通しを追加: sub 確定後の -h/--help は
+    値取り flag の値位置(--notes --help)との弁別が要るため operand 面へ通し check_bd 側で判定する。"""
+    has_C = has_db = has_global = has_readonly = has_help = False
     sub = None
     operands = []
     i, n = 0, len(args)
@@ -264,6 +276,15 @@ def _parse_bd(args):
             has_global = True; i += 1; continue
         if t == "--readonly":
             has_readonly = True; i += 1; continue
+        if t in ("-h", "--help"):
+            # ★un-aukl item(3): 完全一致のみ(--helpx 等の prefix 誤検出禁止)。sub 前の出現は
+            #   global help 確定(値位置は上の --actor 等の値消費が先に食うためここへ来ない)。
+            if sub is None:
+                has_help = True
+            else:
+                operands.append(t)
+            i += 1
+            continue
         if t in GLOBAL_BOOL_FLAGS:
             i += 1; continue
         if t.startswith("-"):
@@ -277,7 +298,7 @@ def _parse_bd(args):
         else:
             operands.append(t)
         i += 1
-    return sub, operands, (has_C or has_db or has_global), has_readonly
+    return sub, operands, (has_C or has_db or has_global), has_readonly, has_help
 
 
 def _val_flags(sub):
@@ -285,6 +306,40 @@ def _val_flags(sub):
     sub = SUBCMD_ALIASES.get(sub, sub)  # alias 経路で override が外れる fail-open を封鎖
     override = SUBCMD_BOOL_OVERRIDES.get(sub)
     return SUBCMD_VAL_FLAGS - override if override else SUBCMD_VAL_FLAGS
+
+
+def _has_help_operand(operands, sub):
+    """operand 面の -h/--help(完全一致のみ・--helpx 等の prefix 誤検出禁止)を検出する(un-aukl item(3))。
+    ★fail-open 封鎖 3 面(help でないのに allow へ落とすと write が素通りする):
+      (1) 値取り flag の直後(値位置)の -h/--help は cobra/pflag が flag でなく「値」として消費し
+          command が実行される(bd update sc-1 --notes --help は notes='--help' の write)→ help 扱いしない。
+      (2) `--` 以降は cobra が flag 解釈を止める(positional 扱い)→ help 扱いしない。
+      (3) SUBCMD_VAL_FLAGS 非登録の dash flag(意図的非登録の id 値 flag --of/--attach/--waits-for 等・
+          bool override 側に倒した flag を含む)は guard から arity 不明で、pflag は非 bool flag の
+          次 token を dash 有無に関係なく値として消費する → 直後の -h/--help が値位置でありうるため
+          即 return False(fail-closed=help 扱いしない→従来判定へ落とす)。help 側へ倒さない取りこぼしは
+          deny FP で安全側、help 側へ倒すと deny→allow 反転=owner-2/funnel moat 破り(un-aukl self-review)。
+          非登録 id 値 flag 集合を val 側へ列挙しないのは意図的: 集合の二重管理ドリフトを避け、未知の
+          将来 flag も自動で fail-closed に落とす。glued(--flag=値)形のみ例外的に読み飛ばして継続する
+          (値を inline 消費し次 token を食わない=arity 既知 0 で、直後の --help は真の help flag)。"""
+    val_flags = _val_flags(sub)
+    i, n = 0, len(operands)
+    while i < n:
+        a = operands[i]
+        if a == "--":
+            return False
+        if a in ("-h", "--help"):
+            return True
+        if a.startswith("-"):
+            if "=" in a:
+                i += 1  # glued 形は次 token を消費しない → help 判定を継続してよい
+                continue
+            if a in val_flags:
+                i += 2  # 登録済値取り flag: 次 token は値位置 → help 扱いしない
+                continue
+            return False  # ★un-aukl fail-closed: 未登録 flag は arity 不明 → help 扱いしない
+        i += 1
+    return False
 
 
 def _external_id_source_flag(sub, operands):
@@ -379,10 +434,15 @@ def _check_repo(operands, foreign, self_pfx):
 
 def check_bd(core, self_pfx):
     """bd コマンドの token 列を判定。(kind, reason) or None(allow)。self_pfx は動的解決値。"""
-    sub, operands, foreign, has_readonly = _parse_bd(core[1:])
+    sub, operands, foreign, has_readonly, has_help = _parse_bd(core[1:])
     if sub is None:
         return None
     if has_readonly:
+        return None
+    # ★un-aukl item(3): -h/--help(完全一致)付き呼出しは cobra が command 非実行で help 表示のみ(実測済)
+    #   = read。write subcmd + --help(bd update --help / bd mol pour --help 等)の rule(c) deny FP を
+    #   短絡 allow で解消する。値位置/`--` 以降の -h/--help は _has_help_operand が help 扱いしない。
+    if has_help or _has_help_operand(operands, sub):
         return None
     if sub in READ_SUBCMDS:
         return None
@@ -417,6 +477,11 @@ def check_bd(core, self_pfx):
     if sub in CREATE_LIKE:
         return ("c", msg_c(self_pfx))  # J7: 新規作成は self 自動採番 → (b) 飛ばし (c)
     pos = _positional_operands(operands, sub)
+    # ★un-aukl item(1): mol pour/wisp は proto から self へ spawn する create 同型 → J7 と同じく
+    #   (b) 飛ばし (c)。positional proto-id(mol pour mol-feat)と --attach 隣接値(--attach mol-x)の
+    #   foreign 誤検出 FP を一挙解消する(alias 正規化後の sub==mol でのみ判定=protomolecule 経路も被覆)。
+    if SUBCMD_ALIASES.get(sub, sub) == "mol" and pos and pos[0] in MOL_CREATE_LIKE:
+        return ("c", msg_c(self_pfx))
     fb = _foreign_beads(pos, self_pfx)
     if fb:
         return ("b", msg_b(self_pfx, " ".join(fb)))
@@ -627,6 +692,33 @@ def run_self_test():
         ("bd gate create sc-1 --waits-for un-9", B, "b", "--waits-for 非登録 → foreign 依然検出 b [id 値 flag 非登録=fail-closed pin]"),
         ("bd gate create sc-1 --blocks un-9", B, "b", "--blocks(id 値)非登録 → foreign 依然検出 b [id 値 flag 非登録=fail-closed pin]"),
         ("bd admin compact --id un-9", B, "b", "--id(id 値)非登録 → foreign 依然検出 b [id 値 flag 非登録=fail-closed pin]"),
+        # ★un-aukl item(1): mol pour/wisp は create 同型(proto → self spawn)= (b) 飛ばし (c)
+        ("bd mol pour mol-feat", B, "c", "un-aukl FP 解消: pour の positional proto-id を foreign 誤検出しない → c"),
+        ("bd mol wisp mol-feat", B, "c", "un-aukl FP 解消: wisp も create 同型 → c"),
+        ("bd protomolecule pour mol-feat", B, "c", "un-aukl: alias 経路(protomolecule)でも create-like 免除 → c"),
+        ("bd mol pour sc-1 --attach mol-x", B, "c", "un-aukl: --attach 隣接値も免除で解消(SUBCMD_VAL_FLAGS 登録不要) → c"),
+        # ★un-aukl item(1) moat: 免除は {pour,wisp} 厳密限定(burn/squash/bond は既存 mol への write のまま b)
+        ("bd mol burn un-9", B, "b", "un-aukl moat: mol burn は免除外 → foreign 依然検出 b"),
+        ("bd mol squash un-9", B, "b", "un-aukl moat: mol squash は免除外 → b"),
+        ("bd mol bond un-9 mol-x", B, "b", "un-aukl moat: mol bond は免除外 → b"),
+        # ★un-aukl item(3): write subcmd + -h/--help は cobra 非実行(help 表示のみ)= allow
+        ("bd update --help", A, None, "un-aukl FP 解消: bd update --help → allow"),
+        ("bd create --help", A, None, "un-aukl FP 解消: bd create --help → allow"),
+        ("bd mol pour --help", A, None, "un-aukl FP 解消: bd mol pour --help → allow"),
+        ("bd update sc-1 -h", A, None, "un-aukl FP 解消: -h 完全一致も allow"),
+        # ★un-aukl item(3) moat: help 扱いの境界(完全一致のみ・値位置/-- 以降は help でない)
+        ("bd update sc-1 --helpx", B, "c", "un-aukl moat: --helpx は help でない(prefix 誤検出禁止) → 従来判定 c"),
+        ("bd update un-9 --notes y", B, "b", "un-aukl moat: --help 無しの foreign write は従来どおり b 不変"),
+        ("bd update un-9 --notes --help", B, "b", "un-aukl moat: 値位置の --help は値(cobra は write 実行) → help 扱いせず b"),
+        ("bd update sc-1 -- --help", B, "c", "un-aukl moat: -- 以降の --help は positional → help 扱いせず c"),
+        # ★un-aukl self-review moat: 非登録 flag(arity 不明)直後の --help は値位置でありうる → fail-closed
+        #   (help 扱いせず従来判定へ)。deny→allow 反転(fail-open)の封鎖 pin 群。mutant M-helpval が守る。
+        ("bd duplicate un-9 --of --help", B, "b", "un-aukl moat: 非登録 id 値 flag(--of)の値位置 --help は help でない → foreign b 維持"),
+        ("bd mol pour sc-1 --attach --help", B, "c", "un-aukl moat: --attach の値位置 --help も help でない → funnel c 維持(bare 迂回封鎖)"),
+        ("bd gate create sc-1 --waits-for --help --blocks un-9", B, "b", "un-aukl moat: --waits-for 値位置 --help を help 扱いせず foreign un-9 を b 検出"),
+        ("bd migrate issues --ids-file --help", B, "a", "un-aukl moat: --ids-file 値位置 --help でも rule(d) deny a 維持"),
+        ("bd update sc-1 --event-target --help", B, "c", "un-aukl moat: --event-target 値位置 --help も help でない → 従来 c"),
+        ("bd update sc-1 --notes=x --help", A, None, "un-aukl: glued 形(--notes=x)は次 token 非消費 → --help は真の help = allow"),
         # launcher / inline / FP
         ("sudo bd update un-1", B, "b", "launcher: sudo"),
         ('bash -c "bd update un-1"', B, "b", "launcher: bash -c"),
