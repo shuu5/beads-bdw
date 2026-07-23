@@ -139,6 +139,31 @@ run_mutant M-idval \
   '"--timeout", "--holder", "--coordinator", "--of", "--event-target", "--waits-for",  # MUTANT' \
   "un-a0t9 id 値 flag 非登録(fail-closed)"
 
+# M-molfp: mol の create-like 免除集合を空に → mol pour/wisp の positional proto-id が foreign 誤検出へ
+#   戻り FP pin(mol pour mol-feat→c)が RED 化。免除分岐が load-bearing である証明(un-aukl)。
+run_mutant M-molfp \
+  'MOL_CREATE_LIKE = {"pour", "wisp"}' \
+  'MOL_CREATE_LIKE = set()  # MUTANT' "un-aukl mol create-like 免除(FP 解消)"
+
+# M-molmoat: 免除を burn へ拡張 → 既存 mol への write(mol burn un-9)が (b)→(c) へ反転し moat pin が
+#   RED 化。{pour,wisp} 厳密限定(拡張禁止=fail-open 封鎖)の非空虚性証明(un-aukl)。
+run_mutant M-molmoat \
+  'MOL_CREATE_LIKE = {"pour", "wisp"}' \
+  'MOL_CREATE_LIKE = {"pour", "wisp", "burn"}  # MUTANT' "un-aukl mol 免除の厳密限定(moat)"
+
+# M-help: -h/--help 短絡を除去 → bd update --help 等が rule(c) deny へ戻り FP pin(allow=0)が RED 化。
+#   has_help 短絡が load-bearing である証明(un-aukl item(3))。
+run_mutant M-help \
+  'if has_help or _has_help_operand(operands, sub):' \
+  'if False:  # MUTANT' "un-aukl write-subcmd+--help 短絡 allow"
+
+# M-helpval: _has_help_operand の未登録 flag fail-closed 分岐を「読み飛ばし継続」へ緩和 → --of/--attach/
+#   --waits-for 等の値位置 --help が help 誤判定され deny(b/a/c)→allow へ反転(fail-open)。self-review
+#   moat pin(bd duplicate un-9 --of --help→b 等)が RED 化。fail-closed 分岐が load-bearing である証明。
+run_mutant M-helpval \
+  'return False  # ★un-aukl fail-closed: 未登録 flag は arity 不明 → help 扱いしない' \
+  'i += 1; continue  # MUTANT' "un-aukl 値位置 --help の fail-closed(未登録 flag)"
+
 echo "----" | tee -a "$LOG"
 if [ "$fails" -eq 0 ]; then
   echo "GUARD MUTANT DIFFERENTIAL: PASS(全 mutant が --self-test を FAIL させた=検証は非空虚)" | tee -a "$LOG"
